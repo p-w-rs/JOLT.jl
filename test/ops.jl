@@ -136,7 +136,7 @@ JOLT.lower(::BadRankOp, a::Tensor, b::Tensor) = JOLT.shlo.add(a.value, b.value)
     @testset "mixed input roles" begin
         new_session!()
         x = Tensor(3)                                    # Argument
-        v = Tensor(Var, [1f0, 2f0, 3f0])                 # Variable
+        v = Tensor(Var, 3)                               # Variable
         c = Tensor(Const, [4f0, 5f0, 6f0])               # Constant
         y = mul(x + v, c)                                # all three in one chain
         @test roleof(y) == Result

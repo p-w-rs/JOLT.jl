@@ -1,5 +1,18 @@
 # =====================================================================
 # Roles
+#
+# A tensor is exactly one of four kinds, and the kind is a type parameter so it
+# drives dispatch (and hard-blocks invalid construction — see below):
+#
+#   Argument — a runtime input (placeholder). The ONLY role that may carry
+#              symbolic / polynomial dims.
+#   Variable — a learnable value: shape + an initializer. Its array is realized
+#              at COMPILE time (not at graph-build time), so it owns no host data
+#              here. Concrete Int dims only.
+#   Constant — a literal value baked into the graph. Created by handing over a
+#              concrete value (scalar or array). Concrete shape only.
+#   Result   — the output of an op. Produced ONLY by the ops layer; a user can
+#              never construct one directly.
 # =====================================================================
 @enum TensorRole Argument Variable Constant Result
 const Arg   = Argument
@@ -15,21 +28,16 @@ const DEFAULT_ELTYPE = Float32
 const DEFAULT_ROLE   = Argument
 
 # =====================================================================
-# Shared mutable data cell.
-#
-# A Variable's host-side value lives in one of these boxes. Because
-# `copy(t) === t` (a Tensor is just a handle), every alias of a variable
-# points at the SAME box: updating through one handle is visible through all
-# of them, and any number of call sites can read it. Arguments, Constants,
-# and Results carry no box (their `data` field is `nothing`).
-# =====================================================================
-mutable struct DataBox{T,N}
-    array::Array{T,N}
-end
-
-# =====================================================================
 # Tensor
 # T - element type (a Real), N - rank, R - TensorRole (a value parameter)
+#
+# The handle carries a role-specific `payload`:
+#   Variable -> its initializer, a function (rng, T, dims...) -> Array
+#   Constant -> its literal value, an Array{T,N}
+#   Argument -> nothing
+#   Result   -> nothing
+# Because the four roles are disjoint, one union field says it all, and every
+# accessor keys off the role (R) so there is never a "which variant is it?" check.
 # =====================================================================
 abstract type AbstractTensor{T,N,R} end
 
@@ -39,9 +47,9 @@ Base.eltype(::Type{<:AbstractTensor{T,N,R}}) where {T,N,R} = T
 Base.eltype(t::AbstractTensor) = eltype(typeof(t))
 
 struct Tensor{T,N,R} <: AbstractTensor{T,N,R}
-    value::IR.Value                    # SSA value this tensor denotes
-    shape::NTuple{N,Dim}               # Int dims are static; Poly dims are runtime (symbolic)
-    data::Union{Nothing,DataBox{T,N}}  # populated only for Variables
+    value::IR.Value                         # SSA value this tensor denotes
+    shape::NTuple{N,Dim}                    # Int dims are static; Poly dims are symbolic
+    payload::Union{Nothing,Function,Array{T,N}}  # init fn (Var) | value (Const) | nothing
 end
 
 # Pull the role (an enum value) back out of the type, in the ndims/eltype style.
@@ -50,19 +58,14 @@ roleof(t::AbstractTensor) = roleof(typeof(t))
 
 # =====================================================================
 # Copy semantics
+#
+# A Tensor is an immutable SSA handle, so `copy`/`deepcopy` alias it. There is
+# no independent host state to clone: a Variable's value doesn't exist until
+# compile, and a Constant's value is a graph literal. To get a second, separately
+# initialized Variable, just construct another one.
 # =====================================================================
-# `copy` and `deepcopy` both alias: a Tensor is an immutable SSA handle, and a
-# Variable's DataBox is meant to be shared. To get an *independent* variable
-# (a fresh block argument seeded with a copy of the current data), use
-# `duplicate` — that intentionally emits new IR.
 Base.copy(t::Tensor)     = t
 Base.deepcopy(t::Tensor) = t
-
-function duplicate(t::Tensor{T,N,Variable}) where {T,N}
-    return push_var!(copy(t.data.array))
-end
-duplicate(t::Tensor) =
-    error("duplicate is only defined for Variable tensors (got $(roleof(t)))")
 
 # =====================================================================
 # Shape & indexing
@@ -105,98 +108,111 @@ end
 Base.show(io::IO, ::MIME"text/plain", t::Tensor) = show(io, t)
 
 # =====================================================================
-# Host-value access — Variable only.
+# Host-value access — Constant only.
 #
-# Enforcement: only a Variable owns host data, so only a Variable can be read
-# or updated. Every other role errors with a clear message rather than silently
-# doing nothing.
+# A Constant's value is a graph literal we keep a copy of, so it is readable.
+# A Variable's value does not exist until compile (it holds an initializer, not
+# data), and Arguments/Results never carry host data — reading any of them is an
+# error with a clear message rather than a silent surprise. There is no
+# setvalue!: Constants are literals and Variables are seeded by their initializer.
 # =====================================================================
-function setvalue!(t::Tensor{T,N,Variable}, x::AbstractArray) where {T,N}
-    size(x) == t.shape ||
-        error("shape mismatch: variable is $(t.shape), got $(size(x))")
-    t.data.array = collect(T, x)
-    return t
-end
-setvalue!(t::Tensor{T,0,Variable}, x::Real) where {T} = (t.data.array = fill(T(x)); t)
-setvalue!(t::Tensor{T,N,Variable}, x) where {T,N} =
-    error("cannot set a Variable from a $(typeof(x)); provide an AbstractArray " *
-          "(or a Real for a scalar Variable)")
-setvalue!(t::Tensor, ::Any) =
-    error("cannot set value: $(roleof(t)) tensors are not updatable — only Variable is")
-
-getvalue(t::Tensor{T,N,Variable}) where {T,N} = t.data.array
+getvalue(t::Tensor{T,N,Constant}) where {T,N} = t.payload::Array{T,N}
+getvalue(t::Tensor{T,N,Variable}) where {T,N} =
+    error("a Variable has no host value until compile; read it from the compiled `vars` container")
 getvalue(t::Tensor) =
-    error("cannot read host value: $(roleof(t)) tensors hold no host data — only Variable does")
+    error("only Constant tensors expose a host value; $(roleof(t)) does not")
+
+# The initializer a Variable will be realized with (internal; the ops/compile
+# layers reach for it, users generally don't).
+initializer(t::Tensor{T,N,Variable}) where {T,N} = t.payload::Function
 
 # =====================================================================
 # Construction surface
 #
-# Every constructor accepts an optional `name` keyword. Whichever you use, the
-# tensor is registered under a role-first path (see the naming rule in
-# session.jl):
-#   - with `name="W"` -> (:<role>s, scope..., :W)    e.g. (:variables, :default, :W)
-#   - without a name   -> (:<role>s, scope..., :_<n>) e.g. (:variables, :default, :_1)
-# `name` and the anonymous fallback go through the exact same registration path.
+# One rule of thumb decides the role when you don't name one:
+#     INTEGERS / SYMBOLS describe a SHAPE   -> Argument
+#     a FLOAT or an ARRAY describes a VALUE  -> Constant
+# and Variables are always spelled out with `Var` (shape + `init`).
 #
-# Rule of thumb: INTEGERS describe a shape, FLOATS / ARRAYS describe a value.
+# Every constructor takes an optional `name`; Variables also take `init`
+# (default `Zeros()`). The tensor is registered under a role-first path
+# (see the naming rule in session.jl):
+#     named    -> (:<role>s, scope..., :<name>)   e.g. (:variables, :default, :W)
+#     anonymous-> (:<role>s, scope..., :_<n>)      e.g. (:variables, :default, :_1)
+#
 #   Tensor(32, 4, 4)                     Argument, default dtype, static shape
 #   Tensor()                             scalar Argument
-#   Tensor(Float32, 8, :N)               Argument, explicit dtype, dynamic (symbolic) dim
-#   Tensor(Var, 784, 128, name="W")      Variable, zero-initialized, named
-#   Tensor(Var, Float32)                 scalar Variable, zero-initialized
-#   Tensor(Var, randn(Float32, 3))       Variable, initialized from data
-#   Tensor(Const, [1f0, 2f0, 3f0])       Constant, value embedded in the graph
+#   Tensor(Float32, 8, :N)               Argument, explicit dtype, symbolic dim
+#   Tensor(Var, 784, 128; init=GlorotUniform(), name="W")   Variable
+#   Tensor(Var, Float32)                 scalar Variable (Zeros init)
+#   Tensor(Var, 10; init=Fill(0.1))      Variable, custom initializer
+#   Tensor(Const, [1f0, 2f0, 3f0])       Constant, value baked into the graph
 #   Tensor(3.0f0)                        scalar Constant
-#   Tensor(Float32, Arg, 8, 8)           dtype + role prefix
-#   Tensor("variables", "Dense", "W")    look up a tensor by its full role-first path
+#   Tensor(Float64, Arg, 8, 8)           dtype + role prefix
+#   Tensor("variables", "Dense", "W")    look a tensor up by its full path
 #
-# A Constant MUST be given a value (there is deliberately no shape-only form);
-# a Variable may be given just a shape (zero-init) or explicit data.
+# Invalid attempts fail fast with a message: symbolic dims on a Variable, a value
+# handed to a Variable, a shape handed to a Constant, or constructing a Result.
 # =====================================================================
 
 # --- helpers ---------------------------------------------------------
 _materialize(a::AbstractArray) = collect(a)                              # dense, owned copy
 _materialize(::Type{T}, a::AbstractArray) where {T} = collect(T, a)
 
-# --- Arguments (placeholders) ---------------------------------------
-Tensor(; name=nothing) = push_arg!(default_dtype(), (); name=name)   # scalar arg (also breaks the empty-varargs tie)
-Tensor(dims::Union{Integer, Symbol, Poly}...; name=nothing) = push_arg!(default_dtype(), map(todim, dims); name=name)
-Tensor(::Type{T}, dims::Union{Integer, Symbol, Poly}...; name=nothing) where {T<:Real} = push_arg!(T, map(todim, dims); name=name)
-
-# --- Argument (explicit) --------------------------------------------
-Tensor(::Val{Argument}, dims::Union{Integer, Symbol, Poly}...; name=nothing) = push_arg!(default_dtype(), map(todim, dims); name=name)
-Tensor(::Val{Argument}, ::Type{T}, dims::Union{Integer, Symbol, Poly}...; name=nothing) where {T<:Real} = push_arg!(T, map(todim, dims); name=name)
+_var_symbolic_err(dims) =
+    error("a Variable owns concrete storage: its dims must be Int (only an Argument " *
+          "may be symbolic). Got $(dims)")
+_var_value_err() =
+    error("a Variable is shape + init, not data — use `Tensor(Var, dims...; init=…)`. " *
+          "For a literal value, make a Constant: `Tensor(Const, value)`.")
 
 # --- role / dtype prefixes trampoline runtime values onto Val dispatch,
-#     forwarding the name keyword through.
-Tensor(R::TensorRole, args...; name=nothing) = Tensor(Val(R), args...; name=name)
-Tensor(::Type{T}, R::TensorRole, args...; name=nothing) where {T<:Real} = Tensor(Val(R), T, args...; name=name)
+#     forwarding ALL keywords (name, init, …) through.
+Tensor(R::TensorRole, args...; kw...) = Tensor(Val(R), args...; kw...)
+Tensor(::Type{T}, R::TensorRole, args...; kw...) where {T<:Real} = Tensor(Val(R), T, args...; kw...)
 
-# --- Variable: shape -> zeros (scalar when no dims), or explicit data
-Tensor(::Val{Variable}, dims::Integer...; name=nothing) = push_var!(zeros(default_dtype(), dims...); name=name)
-Tensor(::Val{Variable}, ::Type{T}, dims::Integer...; name=nothing) where {T<:Real} = push_var!(zeros(T, dims...); name=name)
-Tensor(::Val{Variable}, init::AbstractArray{<:Real}; name=nothing) = push_var!(_materialize(init); name=name)
-Tensor(::Val{Variable}, ::Type{T}, init::AbstractArray{<:Real}; name=nothing) where {T<:Real} = push_var!(_materialize(T, init); name=name)
-Tensor(::Val{Variable}, x::Real; name=nothing) = push_var!(fill(x); name=name)
-Tensor(::Val{Variable}, ::Type{T}, x::Real; name=nothing) where {T<:Real} = push_var!(fill(T(x)); name=name)
+# --- Arguments (placeholders) — the only role that may be symbolic ---
+Tensor(; name=nothing) = push_arg!(default_dtype(), (); name=name)   # scalar arg (breaks the empty-varargs tie)
+Tensor(dims::Union{Integer,Symbol,Poly}...; name=nothing) = push_arg!(default_dtype(), map(todim, dims); name=name)
+Tensor(::Type{T}, dims::Union{Integer,Symbol,Poly}...; name=nothing) where {T<:Real} = push_arg!(T, map(todim, dims); name=name)
+Tensor(::Val{Argument}, dims::Union{Integer,Symbol,Poly}...; name=nothing) = push_arg!(default_dtype(), map(todim, dims); name=name)
+Tensor(::Val{Argument}, ::Type{T}, dims::Union{Integer,Symbol,Poly}...; name=nothing) where {T<:Real} = push_arg!(T, map(todim, dims); name=name)
 
-# --- Constant: MUST carry a value -----------------------------------
+# --- Variable: concrete shape + an initializer (default Zeros()) -----
+Tensor(::Val{Variable}, dims::Integer...; init=Zeros(), name=nothing) =
+    push_var!(init, default_dtype(), map(Int, dims); name=name)
+Tensor(::Val{Variable}, ::Type{T}, dims::Integer...; init=Zeros(), name=nothing) where {T<:Real} =
+    push_var!(init, T, map(Int, dims); name=name)
+# reject symbolic dims (only an Argument may be symbolic)
+Tensor(::Val{Variable}, dims::Union{Integer,Symbol,Poly}...; kw...) = _var_symbolic_err(dims)
+Tensor(::Val{Variable}, ::Type{T}, dims::Union{Integer,Symbol,Poly}...; kw...) where {T<:Real} = _var_symbolic_err(dims)
+# reject a concrete value (that is a Constant now)
+Tensor(::Val{Variable}, ::AbstractArray; kw...) = _var_value_err()
+Tensor(::Val{Variable}, ::Type{<:Real}, ::AbstractArray; kw...) = _var_value_err()
+Tensor(::Val{Variable}, ::AbstractFloat; kw...) = _var_value_err()
+Tensor(::Val{Variable}, ::Type{<:Real}, ::AbstractFloat; kw...) = _var_value_err()
+
+# --- Constant: MUST carry a value; a shape is an error --------------
 Tensor(::Val{Constant}, data::AbstractArray{<:Real}; name=nothing) = push_constant!(_materialize(data); name=name)
 Tensor(::Val{Constant}, ::Type{T}, data::AbstractArray{<:Real}; name=nothing) where {T<:Real} = push_constant!(_materialize(T, data); name=name)
 Tensor(::Val{Constant}, x::Real; name=nothing) = push_constant!(fill(x); name=name)
 Tensor(::Val{Constant}, ::Type{T}, x::Real; name=nothing) where {T<:Real} = push_constant!(fill(T(x)); name=name)
-# Reject the value-less forms explicitly (the trampoline forwards `name`, so
-# these must accept and ignore it):
+# value-less forms (the ≥2-integer methods need two fixed args so a lone scalar
+# above stays a *value*, not a shape):
 Tensor(::Val{Constant}; name=nothing) =
-    error("a Constant needs a value; provide an array or a float scalar, e.g. Tensor(Const, [1f0,2f0])")
-Tensor(::Val{Constant}, dims::Integer...; name=nothing) =
-    error("a Constant needs a value, not a shape ($(dims)); use Tensor(Const, array) or Tensor(Const, scalar)")
-Tensor(::Val{Constant}, ::Type{<:Real}, dims::Integer...; name=nothing) =
+    error("a Constant needs a value; e.g. Tensor(Const, [1f0,2f0]) or Tensor(Const, 3f0)")
+Tensor(::Val{Constant}, d1::Integer, d2::Integer, drest::Integer...; name=nothing) =
+    error("a Constant needs a value, not a shape $((d1, d2, drest...)); use Tensor(Const, array) or Tensor(Const, scalar)")
+Tensor(::Val{Constant}, ::Type{<:Real}, d1::Integer, d2::Integer, drest::Integer...; name=nothing) =
     error("a Constant needs a value, not a shape; use Tensor(Const, array) or Tensor(Const, scalar)")
 
-# --- bare data (no role word) => Constant ---------------------------
+# --- bare value (no role word) => Constant ---------------------------
 Tensor(data::AbstractArray{<:Real}; name=nothing) = push_constant!(_materialize(data); name=name)
-Tensor(x::Real; name=nothing) = push_constant!(fill(x); name=name)
+Tensor(x::AbstractFloat; name=nothing) = push_constant!(fill(x); name=name)
 
-# --- lookup by (possibly scoped) name -------------------------------
+# --- Result: never user-constructed ---------------------------------
+Tensor(::Val{Result}, args...; kw...) =
+    error("Result tensors are produced by operations, not constructed directly")
+
+# --- lookup by full (role-first) path -------------------------------
 Tensor(path::AbstractString...) = lookup(Symbol.(path))

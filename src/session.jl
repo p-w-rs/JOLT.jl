@@ -4,8 +4,8 @@
 # Holds the MLIR context and the block we accumulate ops into, plus the name
 # registry. `mod` is filled at build time. `argvars` records Argument/Variable
 # tensors in block-argument order (that ordering becomes the compiled graph's
-# input signature). A Variable's initial/current value is read straight from
-# its own DataBox, so there's no separate init map to keep in sync.
+# input signature). A Variable carries its initializer, not a value — its array
+# is realized at compile time, so there's no host-side value map to keep in sync.
 # =====================================================================
 mutable struct Session
     context::IR.Context
@@ -194,11 +194,25 @@ function push_arg!(::Type{T}, shape::NTuple{N,Dim}; name=nothing) where {T,N}
     return t
 end
 
-function push_var!(init::Array{T,N}; name=nothing) where {T,N}
+# A Variable is stored as shape + initializer; its array is realized at compile
+# time (the ops/compile layer calls `init(rng, T, dims...)`), so nothing is
+# allocated here. `init` must be a function with the (rng, T, dims...) signature.
+function push_var!(init, ::Type{T}, dims::NTuple{N,Int}; name=nothing) where {T,N}
+    init isa Function ||
+        error("a Variable's init must be a function; got $(typeof(init))")
+    # Verify the signature WITHOUT calling it (no probe allocation): does a method
+    # exist for a rank-N call init(rng::AbstractRNG, T::Type, dims::Int...)? Catches
+    # wrong arity, a missing T argument (e.g. Base.ones), or `Zeros` without `()`.
+    hasmethod(init, Tuple{AbstractRNG,DataType,ntuple(_ -> Int, N)...}) ||
+        error("init has the wrong signature for a rank-$N Variable — it must be callable as " *
+              "init(rng::AbstractRNG, T::Type, dims::Integer...) -> Array (note the T argument). " *
+              "Use Zeros()/Ones()/Fill(…)/RandN(…)/… (with parentheses) or your own closure.")
+    for d in dims                               # a negative Int would mint invalid MLIR
+        d < 0 && error("invalid dimension $d: variable dims must be ≥ 0")
+    end
     s = session()
-    shape = size(init)
-    value = IR.push_argument!(s.block, mlir_type(T, shape))
-    t = Tensor{T,N,Variable}(value, shape, DataBox{T,N}(init))
+    value = IR.push_argument!(s.block, mlir_type(T, dims))
+    t = Tensor{T,N,Variable}(value, dims, init)
     push!(s.argvars, t)
     register!(s, t, name)
     return t
@@ -212,7 +226,7 @@ function push_constant!(data::Array{T,N}; name=nothing) where {T,N}
     s = session()
     op = shlo.constant(; value=IR.DenseElementsAttribute(data), output=mlir_type(T, size(data)))
     push!(s.block, op)
-    t = Tensor{T,N,Constant}(IR.result(op, 1), size(data), nothing)
+    t = Tensor{T,N,Constant}(IR.result(op, 1), size(data), data)   # keep the value for getvalue
     register!(s, t, name)
     return t
 end

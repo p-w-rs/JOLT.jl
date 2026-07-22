@@ -2,7 +2,7 @@
 # tensor.jl — the Tensor value type and its construction surface.
 #
 # Focus: the handle itself (type params, traits, shape, host values, identity)
-# and the internals it wraps (the DataBox, and the MLIR SSA value / type).
+# and the internals it wraps (the payload, and the MLIR SSA value / type).
 # =====================================================================
 
 @testset "tensor" begin
@@ -30,8 +30,8 @@
 
         @test typeof(Tensor(Var, 2, 3))           === JOLT.Tensor{Float32,2,Variable}
         @test typeof(Tensor(Var, Float32))        === JOLT.Tensor{Float32,0,Variable}
-        @test typeof(Tensor(Var, [1f0, 2f0]))     === JOLT.Tensor{Float32,1,Variable}
-        @test typeof(Tensor(Var, Float64, [1f0])) === JOLT.Tensor{Float64,1,Variable}
+        @test typeof(Tensor(Var, 5; init=Ones()))  === JOLT.Tensor{Float32,1,Variable}
+        @test typeof(Tensor(Var, Float64, 2, 2))   === JOLT.Tensor{Float64,2,Variable}
 
         @test typeof(Tensor(Const, [1f0, 2f0]))     === JOLT.Tensor{Float32,1,Constant}
         @test typeof(Tensor([1f0 2f0; 3f0 4f0]))    === JOLT.Tensor{Float32,2,Constant}
@@ -112,30 +112,20 @@
         @test_throws ErrorException t[1]          # symbolic: no indexing
     end
 
-    @testset "host values (Variable only)" begin
+    @testset "host values (Constant only)" begin
         new_session!()
-        v = Tensor(Var, [1f0 2f0; 3f0 4f0])
-        @test getvalue(v) == [1f0 2f0; 3f0 4f0]
+        c = Tensor(Const, [1f0 2f0; 3f0 4f0])
+        @test getvalue(c) == [1f0 2f0; 3f0 4f0]
 
-        setvalue!(v, [5f0 6f0; 7f0 8f0])
-        @test getvalue(v) == [5f0 6f0; 7f0 8f0]
+        # construction copies the value — no aliasing of the caller's array
+        src = [1f0, 2f0, 3f0]
+        c2  = Tensor(Const, src)
+        src[1] = 99f0
+        @test getvalue(c2) == [1f0, 2f0, 3f0]
 
-        sv = Tensor(Var, Float32)
-        setvalue!(sv, 3.0f0)                # scalar overload
-        @test getvalue(sv) == fill(3f0)
-
-        @test_throws ErrorException setvalue!(v, [1f0, 2f0, 3f0])   # shape mismatch
-
-        # only Variables own host data
-        a = Tensor(2, 2)
-        @test_throws ErrorException getvalue(a)
-        @test_throws ErrorException setvalue!(a, [1f0 2f0; 3f0 4f0])
-        @test_throws ErrorException getvalue(Tensor(Const, [1f0]))
-
-        # a Variable given a non-array value gets a message about the VALUE,
-        # not a bogus "Variable tensors are not updatable"
-        err = try setvalue!(v, "nope"); nothing catch e; sprint(showerror, e) end
-        @test occursin("String", err) && occursin("AbstractArray", err)
+        # no other role exposes a host value
+        @test_throws ErrorException getvalue(Tensor(2, 2))     # Argument
+        @test_throws ErrorException getvalue(Tensor(Var, 2))   # Variable: realized at compile
     end
 
     @testset "identity, equality, copy" begin
@@ -150,21 +140,48 @@
         @test deepcopy(a) === a
     end
 
-    @testset "duplicate (Variable only)" begin
+    # The role model refuses invalid tensors up front, with a clear message.
+    @testset "construction guards" begin
         new_session!()
-        v = Tensor(Var, [1f0, 2f0])
-        d = duplicate(v)
-        @test roleof(d)   == Variable
-        @test size(d)     == size(v)
-        @test getvalue(d) == getvalue(v)    # copies the current data...
-        @test d != v                        # ...into a genuinely new SSA value
-        @test d in session().argvars        # and a new block argument
+        # only an Argument may be symbolic
+        @test_throws ErrorException Tensor(Var, :B, 3)
+        @test_throws ErrorException Tensor(Var, Float32, :B)
+        # a Variable is shape + init, never a value (that's a Constant)
+        @test_throws ErrorException Tensor(Var, [1f0, 2f0])
+        @test_throws ErrorException Tensor(Var, 3.0f0)
+        @test_throws ErrorException Tensor(Var, Float64, [1f0])
+        # a Result is produced by ops, never constructed
+        @test_throws ErrorException Tensor(Res)
+        @test_throws ErrorException Tensor(Result, 2, 3)
+        # a wrong-signature init is caught at construction, not deferred to compile
+        @test_throws ErrorException Tensor(Var, 3; init=ones)    # Base.ones: no (rng, T, …) method
+        @test_throws ErrorException Tensor(Var, 3; init=Zeros)   # forgot the parentheses
+        @test_throws ErrorException Tensor(Var, 3; init=42)      # not even a function
+    end
 
-        setvalue!(d, [9f0, 9f0])
-        @test getvalue(v) == [1f0, 2f0]     # boxes are independent
+    # Initializers are plain closures (rng, T, dims...) -> Array; a Variable
+    # stores one and it is only *called* at compile time.
+    @testset "initializers" begin
+        rng() = JOLT.Random.MersenneTwister(0)
+        @test Zeros()(rng(), Float32, 2, 3) == zeros(Float32, 2, 3)
+        @test Ones()(rng(), Float64, 4)     == ones(Float64, 4)
+        @test Fill(0.5)(rng(), Float32, 3)  == fill(0.5f0, 3)
 
-        @test_throws ErrorException duplicate(Tensor(2, 2))        # non-Variable
-        @test_throws ErrorException duplicate(Tensor(Const, [1f0]))
+        # random inits: right dtype/shape, and deterministic given the same rng
+        r = RandN(0, 2)(rng(), Float32, 100)
+        @test eltype(r) == Float32 && size(r) == (100,)
+        @test RandN(0, 2)(rng(), Float32, 100) == r          # same seed -> same draw
+
+        g = GlorotUniform()(rng(), Float32, 4, 5)
+        @test eltype(g) == Float32 && size(g) == (4, 5)
+
+        # a Variable stores the initializer function unevaluated
+        new_session!()
+        @test JOLT.initializer(Tensor(Var, 2; init=Ones())) isa Function
+
+        # a user-supplied closure works just as well
+        my = (rng, T, dims...) -> fill(T(7), dims...)
+        @test my(rng(), Float32, 2) == fill(7f0, 2)
     end
 
     @testset "display" begin
@@ -177,23 +194,17 @@
         @test sprint(show, MIME("text/plain"), Tensor(2, 2)) == "Tensor{Float32,2,Argument}(2×2)"
     end
 
-    # Poke at the fields directly: the data cell, its typing, and copy semantics.
-    @testset "internals: fields & DataBox" begin
+    # Poke at the payload field directly (per-role) and the shape field.
+    @testset "internals: payload" begin
         new_session!()
-        @test Tensor(2, 2).data === nothing            # arguments carry no box
-        @test Tensor(Const, [1f0]).data === nothing    # neither do constants
+        @test Tensor(2, 2).payload === nothing             # an Argument carries nothing
+        v = Tensor(Var, 2, 3)
+        @test v.payload isa Function                       # a Variable carries its initializer
+        c = Tensor(Const, [1f0, 2f0])
+        @test c.payload == [1f0, 2f0]                      # a Constant carries its value
+        @test getvalue(c) === c.payload
 
-        v = Tensor(Var, [1f0, 2f0])
-        @test v.data isa JOLT.DataBox{Float32,1}
-        @test getvalue(v) === v.data.array             # getvalue returns the box's array
-
-        # construction copies host data — no aliasing of the caller's array
-        src = [1f0, 2f0, 3f0]
-        w = Tensor(Var, src)
-        src[1] = 99f0
-        @test getvalue(w) == [1f0, 2f0, 3f0]
-
-        @test Tensor(2, :M).shape == (2, todim(:M))    # shape field holds the symbolic dim
+        @test Tensor(2, :M).shape == (2, todim(:M))        # shape field holds the symbolic dim
         @test Tensor(2, :M).shape[2] isa JOLT.Poly
     end
 
@@ -210,7 +221,7 @@
         @test mlir_ranked(Tensor())                          == (Float32, ())
         @test mlir_ranked(Tensor(Float32, 8, :N))            == (Float32, (8, :dyn))   # symbolic -> ?
         @test mlir_ranked(Tensor(:B, 10))                    == (Float32, (:dyn, 10))
-        @test mlir_ranked(Tensor(Var, [1f0, 2f0]))           == (Float32, (2,))
+        @test mlir_ranked(Tensor(Var, 2))                    == (Float32, (2,))
         @test mlir_ranked(Tensor(Const, [1f0 2f0; 3f0 4f0])) == (Float32, (2, 2))
     end
 
