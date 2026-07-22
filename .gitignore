@@ -1,0 +1,16 @@
+# Build artifacts (the IREE compiler + runtime shim are fetched/built into Scratch, not here)
+deps/build.log
+*.vmfb
+*.mlirbc
+
+# OS / editor
+.DS_Store
+.claude
+
+# Temp
+spike
+references
+src_archive
+
+# Note: Manifest.toml is intentionally committed — the Reactant ↔ StableHLO ↔ IREE versions
+# are tightly coupled (see references/ARCHITECTURE.md), so we pin the whole environment.
