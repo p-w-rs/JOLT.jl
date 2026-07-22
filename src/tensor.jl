@@ -131,11 +131,12 @@ getvalue(t::Tensor) =
 # =====================================================================
 # Construction surface
 #
-# Every constructor accepts an optional `name` keyword. Whether or not you give
-# one, the tensor is registered in the session under the CURRENT namespace:
-#   - with `name="W"`  -> registered as (current_scope..., :W)
-#   - without a name    -> registered as (current_scope..., :<role>#<n>)
-# So `name` and the anonymous fallback are handled by the exact same path.
+# Every constructor accepts an optional `name` keyword. Whichever you use, the
+# tensor is registered under a role-first path (see the naming rule in
+# session.jl):
+#   - with `name="W"` -> (:<role>s, scope..., :W)    e.g. (:variables, :default, :W)
+#   - without a name   -> (:<role>s, scope..., :_<n>) e.g. (:variables, :default, :_1)
+# `name` and the anonymous fallback go through the exact same registration path.
 #
 # Rule of thumb: INTEGERS describe a shape, FLOATS / ARRAYS describe a value.
 #   Tensor(32, 4, 4)                     Argument, default dtype, static shape
@@ -147,7 +148,7 @@ getvalue(t::Tensor) =
 #   Tensor(Const, [1f0, 2f0, 3f0])       Constant, value embedded in the graph
 #   Tensor(3.0f0)                        scalar Constant
 #   Tensor(Float32, Arg, 8, 8)           dtype + role prefix
-#   Tensor("Dense", "W")                 look up a previously-registered tensor
+#   Tensor("variables", "Dense", "W")    look up a tensor by its full role-first path
 #
 # A Constant MUST be given a value (there is deliberately no shape-only form);
 # a Variable may be given just a shape (zero-init) or explicit data.

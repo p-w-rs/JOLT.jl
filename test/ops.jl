@@ -41,8 +41,8 @@ JOLT.lower(::BadRankOp, a::Tensor, b::Tensor) = JOLT.shlo.add(a.value, b.value)
         @test out === z
         @test node.shape == (2, 3)
 
-        # results are registered anonymously
-        @test any(startswith(string(k[end]), "result#") for k in keys(s.names))
+        # results are registered anonymously under the :results role
+        @test any(k -> k[1] === :results && startswith(string(k[end]), "_"), keys(s.names))
     end
 
     @testset "mul: forward & chaining" begin

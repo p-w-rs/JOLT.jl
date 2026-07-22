@@ -1,5 +1,3 @@
-using Base.ScopedValues: ScopedValue, with
-
 # =====================================================================
 # Session
 #
@@ -13,8 +11,9 @@ mutable struct Session
     context::IR.Context
     block::IR.Block
     argvars::Vector{Tensor}                     # Arg/Var tensors, in block-argument order
+    scope::Vector{Symbol}                       # current namespace stack (mutable)
     names::Dict{Tuple{Vararg{Symbol}},Tensor}   # scoped path -> tensor
-    anon::Base.RefValue{Int}                    # monotonic counter for anonymous names
+    anon::Dict{Symbol,Base.RefValue{Int}}             # monotonic counters for anonymous names
     outputs::Vector{Tensor}                     # set when the graph is finalized
     mod::Union{Nothing,IR.Module}
     facts::Facts                                # symbolic-dim constraints (dims.jl)
@@ -22,23 +21,14 @@ mutable struct Session
 end
 
 function Session()
-    # ---------------------------------------------------------------
-    # MLIR bootstrap.  VERIFY these two calls against your Reactant/MLIR
-    # bindings — they are the only spot in JOLT that depends on the exact
-    # binding API:
-    #   1. context creation (and loading the func + stablehlo dialects), and
-    #   2. an empty entry block that `push_argument!` can append to.
-    # If type/attr construction later complains about no active context, wrap
-    # the builders below in your bindings' `context!`/`activate!` equivalent.
-    # ---------------------------------------------------------------
     ctx   = Reactant.ReactantContext()
     block = IR.Block()
-    # ---------------------------------------------------------------
     return Session(
         ctx, block,
         Tensor[],
+        Symbol[],
         Dict{Tuple{Vararg{Symbol}},Tensor}(),
-        Ref(0),
+        Dict{Symbol,Base.RefValue{Int}}(),
         Tensor[],
         nothing,
         Facts(),
@@ -127,35 +117,48 @@ function with_session(f, s::Session)
 end
 
 # =====================================================================
-# Name scopes.
+# Naming, scopes & the name registry
 #
-# A dynamically-scoped prefix stack (TF's `name_scope`). Uses a ScopedValue so
-# it's naturally stack-shaped and task-safe. Nest with a do-block:
+# Every tensor is registered under a PATH of the form
 #
-#   namespace("Dense") do
-#       W = Tensor(Var, 784, 128, name="W")   # registered as (:Dense, :W)
-#       b = Tensor(Var, 128, name="b")        # registered as (:Dense, :b)
-#   end
-# =====================================================================
-const _SCOPE = ScopedValue{Tuple{Vararg{Symbol}}}(())
-
-current_scope() = _SCOPE[]
-
-namespace(f, name) = with(() -> f(), _SCOPE => (_SCOPE[]..., Symbol(name)))
-
-# =====================================================================
-# Name registry — one function for both named and anonymous tensors.
+#       (role, scope..., leaf)
 #
-# `name === nothing` means "no name given": we mint a guaranteed-unique
-# anonymous leaf like `variable#3` (the counter only ever increases, so these
-# never collide). Otherwise the leaf is the name you passed. Either way the
-# leaf is qualified by the current namespace and stored.
+#   role   — the tensor's kind, pluralized: :variables, :arguments,
+#            :constants, :results. Role is the TOP level on purpose: a query
+#            (e.g. a gradient) taken "wrt a top-level scope" then includes
+#            everything registered beneath it, for free.
+#   scope  — the active namespace stack, or (:default,) when the stack is
+#            empty. Each nested namespace contributes one Symbol.
+#   leaf   — the name you passed, or an anonymous `_N` when you passed none.
+#            `N` is a per-role monotonic counter (s.anon[role]), so anonymous
+#            leaves are unique across ALL scopes of that role and never clash.
+#
+# Examples:
+#       Tensor(Var, 8)                 ->  (:variables, :default, :_1)
+#       x + y   (a Result)             ->  (:results,   :default, :_1)
+#       namespace("params") do
+#           Tensor(Var, 8)             ->  (:variables, :params,  :_2)
+#           Tensor(Var, 8, name="W")   ->  (:variables, :params,  :W)
+#       end
+#
+# The scope is a plain MUTABLE stack (not a ScopedValue). Drive it directly
+# with pushnamespace!/popnamespace!/clearnamespace!, or — preferred — with the
+# `namespace(name) do … end` wrapper, which pushes on entry and pops in a
+# `finally`, so the stack unwinds even if the body throws.
 # =====================================================================
+effective_scope() = isempty(session().scope) ? (:default,) : Tuple(session().scope)
+
+pushnamespace!(n)  = (push!(session().scope, Symbol(n)); nothing)
+popnamespace!()    = (isempty(session().scope) && error("namespace stack empty"); pop!(session().scope); nothing)
+clearnamespace!()  = (empty!(session().scope); nothing)
+namespace(f, n)    = (pushnamespace!(n); try f() finally popnamespace!() end)
+
+# register! / lookup implement the (role, scope..., leaf) path rule above.
 function register!(s::Session, t::Tensor, name)
-    leaf = name === nothing ?
-        Symbol(lowercase(string(roleof(t))), '#', (s.anon[] += 1)) :
-        Symbol(name)
-    path = (current_scope()..., leaf)
+    role = Symbol(lowercase(string(roleof(t))), 's')
+    anon = get!(() -> Ref(0), s.anon, role)
+    leaf = name === nothing ? Symbol('_', anon[] += 1) : Symbol(name)
+    path = (role, effective_scope()..., leaf)
     haskey(s.names, path) && error("name already bound: \"", join(path, "/"), "\"")
     s.names[path] = t
     return t

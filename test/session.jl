@@ -14,7 +14,7 @@
         @test isempty(s.argvars) && isempty(s.names) && isempty(s.outputs)
         @test isempty(s.tape)               # no ops emitted yet
         @test isempty(s.facts.decls)        # no constraints declared yet
-        @test s.anon[] == 0
+        @test isempty(s.anon)               # no anonymous names minted yet
 
         s1 = new_session!()
         @test session() === s1
@@ -162,26 +162,28 @@
 
     @testset "name registry" begin
         s = new_session!()
-        @test s.anon[] == 0
+        @test isempty(s.anon)
 
         Tensor(2; name="x")                 # named: anon counter untouched
-        @test s.anon[] == 0
-        @test haskey(s.names, (:x,))
+        @test s.anon[:arguments][] == 0
+        @test haskey(s.names, (:arguments, :default, :x))
         @test length(s.names) == 1
 
         Tensor()                            # anonymous: counter advances
-        @test s.anon[] == 1
-        @test haskey(s.names, (Symbol("argument#1"),))
+        @test s.anon[:arguments][] == 1
+        @test haskey(s.names, (:arguments, :default, :_1))
 
-        # counter is shared and monotonic across roles
+        # counters are PER-ROLE (per tensor type): each starts fresh at _1
         s = new_session!()
-        Tensor(Var, 2)                      # variable#1
-        Tensor(2, 2)                        # argument#2
-        Tensor(Const, [1f0])                # constant#3
-        @test s.anon[] == 3
-        @test haskey(s.names, (Symbol("variable#1"),))
-        @test haskey(s.names, (Symbol("argument#2"),))
-        @test haskey(s.names, (Symbol("constant#3"),))
+        Tensor(Var, 2)                      # (:variables, :default, :_1)
+        Tensor(2, 2)                        # (:arguments, :default, :_1)
+        Tensor(Const, [1f0])                # (:constants, :default, :_1)
+        @test s.anon[:variables][]  == 1
+        @test s.anon[:arguments][]  == 1
+        @test s.anon[:constants][]  == 1
+        @test haskey(s.names, (:variables, :default, :_1))
+        @test haskey(s.names, (:arguments, :default, :_1))
+        @test haskey(s.names, (:constants, :default, :_1))
 
         # duplicate names within a scope are rejected; misses error
         new_session!()
@@ -192,32 +194,32 @@
         # string lookup returns the very same handle
         new_session!()
         W = Tensor(Var, 2, 2; name="W")
-        @test JOLT.lookup((:W,)) === W
-        @test Tensor("W") === W
+        @test JOLT.lookup((:variables, :default, :W)) === W
+        @test Tensor("variables", "default", "W") === W
     end
 
     @testset "namespaces" begin
         new_session!()
-        @test JOLT.current_scope() == ()
+        @test JOLT.effective_scope() == (:default,)
         w = namespace("Dense") do
-            @test JOLT.current_scope() == (:Dense,)
+            @test JOLT.effective_scope() == (:Dense,)
             inner = namespace("Layer") do
-                @test JOLT.current_scope() == (:Dense, :Layer)
+                @test JOLT.effective_scope() == (:Dense, :Layer)
                 Tensor(Var, 2; name="w")
             end
-            @test JOLT.current_scope() == (:Dense,)   # inner scope popped
+            @test JOLT.effective_scope() == (:Dense,)   # inner scope popped
             inner
         end
-        @test JOLT.current_scope() == ()              # outer scope popped
-        @test JOLT.lookup((:Dense, :Layer, :w)) === w
-        @test Tensor("Dense", "Layer", "w") === w
+        @test JOLT.effective_scope() == (:default,)     # outer scope popped
+        @test JOLT.lookup((:variables, :Dense, :Layer, :w)) === w
+        @test Tensor("variables", "Dense", "Layer", "w") === w
 
         # anonymous names are qualified by the current scope, too
         new_session!()
         namespace("A") do
             Tensor(Var, 2)
         end
-        @test haskey(session().names, (:A, Symbol("variable#1")))
+        @test haskey(session().names, (:variables, :A, :_1))
     end
 
     # Declaring args/vars appends block arguments in declaration order;

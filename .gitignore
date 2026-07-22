@@ -14,3 +14,4 @@ src_archive
 
 # Note: Manifest.toml is intentionally committed — the Reactant ↔ StableHLO ↔ IREE versions
 # are tightly coupled (see references/ARCHITECTURE.md), so we pin the whole environment.
+Manifest.toml

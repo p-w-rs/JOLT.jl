@@ -38,6 +38,6 @@ include("session.jl")   # Session, globals, facts/tape, name registry, IR builde
 export Session, session, session!, new_session!, reset_session!, with_session
 export current_facts
 export default_dtype, default_dtype!
-export namespace
+export namespace, pushnamespace!, popnamespace!, clearnamespace!
 
 end # module JOLT
