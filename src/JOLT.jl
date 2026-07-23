@@ -15,6 +15,9 @@ const shlo  = MLIR.Dialects.stablehlo
 const funcd = MLIR.Dialects.func
 
 using Random   # rng-driven initializers (randn/rand) in initializers.jl
+using ComponentArrays        # the `vars` container returned by compile
+using StableRNGs             # version-stable per-variable init streams
+import Libdl, SHA            # Libdl: dlopen/ccall the IREE shim;  SHA: stable seeds
 
 # Include order matters for TYPES (each file's structs must exist before a
 # later file mentions them in a field or signature): dims.jl defines Dim/Facts,
@@ -51,5 +54,10 @@ include("ops/reshaping.jl")   # reshape, transpose (permutedims), broadcast_to, 
 include("ops/matmul.jl")      # * — batched matmul
 include("ops/gradients.jl")   # ∇/gradient, stop_gradient, grad_reversal
 export mul, ∇, gradient, stop_gradient, grad_reversal, reduce_sum, broadcast_to
+
+include("compile/module.jl")  # graph → func.func → StableHLO module + text
+include("compile/iree.jl")    # IREE backend: iree-compile subprocess + runtime ccall shim
+include("compile/compile.jl") # compile / export / vars ComponentArray / the fn closure
+export compile, export_stablehlo, IREEBackend, IREE_CPU, IREE_METAL
 
 end # module JOLT

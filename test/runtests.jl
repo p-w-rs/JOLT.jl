@@ -16,4 +16,5 @@ include("util.jl")
     include("reshaping.jl")   # reshape, transpose, broadcasting (.+ .- .*)
     include("matmul.jl")      # *
     include("gradients.jl")   # ∇, second order, stop_gradient, grad_reversal, broadcasting grads
+    include("compile.jl")     # end-to-end IREE compile+run (skips if IREE isn't built)
 end
