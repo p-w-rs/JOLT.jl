@@ -11,14 +11,14 @@ mutable struct Session
     context::IR.Context
     block::IR.Block
     dtype::DataType                             # default element type when a constructor is given none
-    argvars::Vector{Tensor}                     # Arg/Var tensors, in block-argument order
+    argvars::Vector{AbstractTensor}             # Argument/Variable tensors, in block-argument order
     scope::Vector{Symbol}                       # current namespace stack (mutable)
-    names::Dict{Tuple{Vararg{Symbol}},Tensor}   # scoped path -> tensor
+    names::Dict{Tuple{Vararg{Symbol}},AbstractTensor}  # scoped path -> tensor
     anon::Dict{Symbol,Base.RefValue{Int}}             # monotonic counters for anonymous names
-    outputs::Vector{Tensor}                     # set when the graph is finalized
+    outputs::Vector{AbstractTensor}             # set when the graph is finalized
     mod::Union{Nothing,IR.Module}
     facts::Facts                                # symbolic-dim constraints (dims.jl)
-    tape::Vector{Tuple{OpNode,Tensor}}          # (node, output), in emission order — the AD tape
+    tape::Vector{Tuple{OpNode,AbstractTensor}}  # (node, output), in emission order — the AD tape
 end
 
 function Session()
@@ -27,14 +27,14 @@ function Session()
     return Session(
         ctx, block,
         Float32,                                # dtype seed (default element type)
-        Tensor[],
+        AbstractTensor[],
         Symbol[],
-        Dict{Tuple{Vararg{Symbol}},Tensor}(),
+        Dict{Tuple{Vararg{Symbol}},AbstractTensor}(),
         Dict{Symbol,Base.RefValue{Int}}(),
-        Tensor[],
+        AbstractTensor[],
         nothing,
         Facts(),
-        Tuple{OpNode,Tensor}[],
+        Tuple{OpNode,AbstractTensor}[],
     )
 end
 
@@ -115,7 +115,7 @@ end
 # convenience queries (dims_equal, same_dim!, …) reach the session.
 current_facts() = session().facts
 
-# Its default element type — what a Tensor constructor uses when given no dtype.
+# Its default element type — what a tensor constructor uses when given no dtype.
 # A Session field (seeded to Float32 in Session()), so a fresh session starts
 # from the default; default_dtype!(T) changes it for the active session only.
 default_dtype()            = session().dtype
@@ -139,11 +139,11 @@ default_dtype!(::Type{T}) where {T<:Real} = (session().dtype = T; T)
 #            leaves are unique across ALL scopes of that role and never clash.
 #
 # Examples:
-#       Tensor(Var, 8)                 ->  (:variables, :default, :_1)
+#       Var(8)                         ->  (:variables, :default, :_1)
 #       x + y   (a Result)             ->  (:results,   :default, :_1)
 #       namespace("params") do
-#           Tensor(Var, 8)             ->  (:variables, :params,  :_2)
-#           Tensor(Var, 8, name="W")   ->  (:variables, :params,  :W)
+#           Var(8)                     ->  (:variables, :params,  :_2)
+#           Var(8, name="W")           ->  (:variables, :params,  :W)
 #       end
 #
 # The scope is a plain MUTABLE stack (not a ScopedValue). Drive it directly
@@ -163,8 +163,8 @@ namespace(f, n)    = (pushnamespace!(n); try f() finally popnamespace!() end)
 # same transactional guarantee push_op! gives for a rejected op. The role is
 # known statically (no built tensor, hence no emitted IR, is needed to resolve
 # it); the builder commits `s.names[path] = t` only after the IR is built.
-function _resolve!(s::Session, role_enum::TensorRole, name)
-    role = Symbol(lowercase(string(role_enum)), 's')
+function _resolve!(s::Session, ::Type{R}, name) where {R<:AbstractTensor}
+    role = Symbol(lowercase(String(nameof(R))), 's')       # Argument -> :arguments
     ctr  = get!(() -> Ref(0), s.anon, role)                # ensure the per-role counter exists
     leaf = name === nothing ? Symbol('_', ctr[] += 1) : Symbol(name)   # anon leaves never collide
     path = (role, effective_scope()..., leaf)
@@ -178,9 +178,23 @@ function lookup(path::Tuple{Vararg{Symbol}})
     return s.names[path]
 end
 
+# Fetch a previously-named tensor from the active session's registry. The
+# role-specific getters supply the role head implicitly, so you pass the scope
+# path + leaf (top-level scope is "default"); `getTensor` takes the full path.
+#     getVariable("Dense", "W")   ==  getTensor("variables", "Dense", "W")
+#     getArgument("default", "x") ==  getTensor("arguments", "default", "x")
+getArgument(path::AbstractString...) = lookup((:arguments, Symbol.(path)...))
+getVariable(path::AbstractString...) = lookup((:variables, Symbol.(path)...))
+getConstant(path::AbstractString...) = lookup((:constants, Symbol.(path)...))
+getTensor(path::AbstractString...)   = lookup(Symbol.(path))
+const getArg   = getArgument
+const getVar   = getVariable
+const getConst = getConstant
+
 # =====================================================================
-# IR builders. These take the Session explicitly; the public Tensor
-# constructors pass `session()`. Each forwards `name` to `register!`.
+# IR builders. These take the Session explicitly; the public constructors
+# (Argument/Variable/Constant) reach the active session via `session()`. Each
+# forwards `name` to the name registry.
 # =====================================================================
 
 # Julia shape (Int | symbolic Dim) -> MLIR ranked tensor type. Symbolic dims
@@ -203,7 +217,7 @@ function push_arg!(shape::NTuple{N,Dim}, ::Type{T}=default_dtype(); name=nothing
     s = session()
     path  = _resolve!(s, Argument, name)          # collision check BEFORE mutating the block
     value = IR.push_argument!(s.block, mlir_type(T, shape))
-    t = Tensor{T,N,Argument}(value, shape, nothing)
+    t = Argument{T,N}(value, shape)
     push!(s.argvars, t)
     s.names[path] = t
     return t
@@ -228,7 +242,7 @@ function push_var!(init, dims::NTuple{N,Int}, ::Type{T}=default_dtype(); name=no
     s = session()
     path  = _resolve!(s, Variable, name)          # collision check BEFORE mutating the block
     value = IR.push_argument!(s.block, mlir_type(T, dims))
-    t = Tensor{T,N,Variable}(value, dims, init)
+    t = Variable{T,N}(value, dims, init)
     push!(s.argvars, t)
     s.names[path] = t
     return t
@@ -243,7 +257,7 @@ function push_constant!(data::Array{T,N}; name=nothing) where {T,N}
     path = _resolve!(s, Constant, name)           # collision check BEFORE mutating the block
     op = shlo.constant(; value=IR.DenseElementsAttribute(data), output=mlir_type(T, size(data)))
     push!(s.block, op)
-    t = Tensor{T,N,Constant}(IR.result(op, 1), size(data), data)   # keep the value for getvalue
+    t = Constant{T,N}(IR.result(op, 1), size(data), data)   # keep the value for getvalue
     s.names[path] = t
     return t
 end
@@ -252,7 +266,7 @@ end
 # block — as a block argument (Arg/Var) or as a result of an op in the block
 # (Const/Result). Mixing sessions would silently build cross-context IR that
 # only fails much later, inside MLIR verification.
-function _owned(s::Session, t::Tensor)
+function _owned(s::Session, t::AbstractTensor)
     v = t.value
     IR.is_block_arg(v) && return IR.block_owner(v) == s.block
     return IR.block(IR.op_owner(v)) == s.block
@@ -286,7 +300,7 @@ function push_op!(n::OpNode)
     end
     path = _resolve!(s, Result, nothing)          # results never collide; resolve, then append
     push!(s.block, n.ir)
-    t = Tensor{T,N,Result}(value, Tuple(n.shape), nothing)
+    t = Result{T,N}(value, Tuple(n.shape))
     push!(s.tape, (n, t))
     s.names[path] = t
     return t

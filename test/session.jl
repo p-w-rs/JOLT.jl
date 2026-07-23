@@ -19,7 +19,7 @@
         s1 = new_session!()
         @test session() === s1
         @test sprint(show, s1) == "Session(0 inputs, 0 named, 0 outputs)"
-        Tensor()                            # one anonymous scalar argument
+        Arg()                            # one anonymous scalar argument
         @test sprint(show, s1) == "Session(1 inputs, 1 named, 0 outputs)"
 
         s2 = new_session!()                 # fresh, replaces s1
@@ -31,7 +31,7 @@
         scratch = Session()
         n = with_session(scratch) do
             @test session() === scratch
-            Tensor(2, 3)
+            Arg(2, 3)
             length(scratch.argvars)
         end
         @test n == 1
@@ -40,7 +40,7 @@
 
         # session! re-installs an existing session with its state intact.
         a = new_session!()
-        Tensor(4)
+        Arg(4)
         b = new_session!()
         @test session() === b
         session!(a)
@@ -49,7 +49,7 @@
 
         # reset drops the current session; next session() builds a fresh one.
         new_session!()
-        Tensor(4)
+        Arg(4)
         reset_session!()
         @test JOLT._SESSION[] === nothing
         @test isempty(session().argvars)
@@ -108,7 +108,7 @@
         scratch = Session()
         inner = with_session(scratch) do
             new_session!()                               # swap mid-block
-            Tensor(2)
+            Arg(2)
             session()
         end
         @test session() === outer                        # outer restored regardless
@@ -151,8 +151,8 @@
         @test default_dtype() == Float32               # fresh session default
         default_dtype!(Float64)
         @test default_dtype() == Float64
-        @test eltype(Tensor(3))      == Float64         # arg picks up the session default
-        @test eltype(Tensor(Var, 2)) == Float64         # so does a variable
+        @test eltype(Arg(3))      == Float64         # arg picks up the session default
+        @test eltype(Var(2)) == Float64         # so does a variable
         new_session!()
         @test default_dtype() == Float32               # a fresh session resets it
     end
@@ -161,20 +161,20 @@
         s = new_session!()
         @test isempty(s.anon)
 
-        Tensor(2; name="x")                 # named: anon counter untouched
+        Arg(2; name="x")                 # named: anon counter untouched
         @test s.anon[:arguments][] == 0
         @test haskey(s.names, (:arguments, :default, :x))
         @test length(s.names) == 1
 
-        Tensor()                            # anonymous: counter advances
+        Arg()                            # anonymous: counter advances
         @test s.anon[:arguments][] == 1
         @test haskey(s.names, (:arguments, :default, :_1))
 
         # counters are PER-ROLE (per tensor type): each starts fresh at _1
         s = new_session!()
-        Tensor(Var, 2)                      # (:variables, :default, :_1)
-        Tensor(2, 2)                        # (:arguments, :default, :_1)
-        Tensor(Const, [1f0])                # (:constants, :default, :_1)
+        Var(2)                      # (:variables, :default, :_1)
+        Arg(2, 2)                        # (:arguments, :default, :_1)
+        Const([1f0])                # (:constants, :default, :_1)
         @test s.anon[:variables][]  == 1
         @test s.anon[:arguments][]  == 1
         @test s.anon[:constants][]  == 1
@@ -184,17 +184,19 @@
 
         # duplicate names within a scope are rejected; misses error
         s = new_session!()
-        Tensor(2; name="dup")
+        Arg(2; name="dup")
         nargv, nnames = length(s.argvars), length(s.names)
-        @test_throws ErrorException Tensor(2; name="dup")
+        @test_throws ErrorException Arg(2; name="dup")
         @test length(s.argvars) == nargv && length(s.names) == nnames  # rejected name leaves NO orphan state
         @test_throws ErrorException JOLT.lookup((:missing,))
 
         # string lookup returns the very same handle
         new_session!()
-        W = Tensor(Var, 2, 2; name="W")
+        W = Var(2, 2; name="W")
         @test JOLT.lookup((:variables, :default, :W)) === W
-        @test Tensor("variables", "default", "W") === W
+        @test getTensor("variables", "default", "W") === W    # full role-first path
+        @test getVariable("default", "W") === W               # role head implied
+        @test getVar("default", "W") === W                    # shorthand alias
     end
 
     @testset "namespaces" begin
@@ -204,19 +206,19 @@
             @test JOLT.effective_scope() == (:Dense,)
             inner = namespace("Layer") do
                 @test JOLT.effective_scope() == (:Dense, :Layer)
-                Tensor(Var, 2; name="w")
+                Var(2; name="w")
             end
             @test JOLT.effective_scope() == (:Dense,)   # inner scope popped
             inner
         end
         @test JOLT.effective_scope() == (:default,)     # outer scope popped
         @test JOLT.lookup((:variables, :Dense, :Layer, :w)) === w
-        @test Tensor("variables", "Dense", "Layer", "w") === w
+        @test getVariable("Dense", "Layer", "w") === w        # nested scope, role head implied
 
         # anonymous names are qualified by the current scope, too
         new_session!()
         namespace("A") do
-            Tensor(Var, 2)
+            Var(2)
         end
         @test haskey(session().names, (:variables, :A, :_1))
     end
@@ -227,19 +229,19 @@
         s = new_session!()
         @test JOLT.IR.nargs(s.block) == 0
 
-        a = Tensor(3, 4)
-        v = Tensor(Var, 2)
+        a = Arg(3, 4)
+        v = Var(2)
         @test JOLT.IR.nargs(s.block) == 2
         @test length(s.argvars) == 2
         @test s.argvars[1] === a && s.argvars[2] === v
         @test JOLT.IR.argument(s.block, 1) == a.value     # order preserved
         @test JOLT.IR.argument(s.block, 2) == v.value
 
-        Tensor(Const, [1f0])                # a constant is neither
+        Const([1f0])                # a constant is neither
         @test JOLT.IR.nargs(s.block) == 2
         @test length(s.argvars) == 2
 
-        sy = Tensor(:B, 4)                  # a symbolic-dim arg is still a block arg
+        sy = Arg(:B, 4)                  # a symbolic-dim arg is still a block arg
         @test JOLT.IR.nargs(s.block) == 3
         @test s.argvars[3] === sy
     end

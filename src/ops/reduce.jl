@@ -49,14 +49,14 @@ end
 # dynamic (e.g. summing over a :B batch), its runtime size is read from ins[1] via
 # dynamic_broadcast_in_dim — which is what makes gradients of dynamic-dim graphs work.
 vjp(op::ReduceSumOp, ȳ, ins, out) =
-    (broadcast_to(ȳ, size(ins[1]), [i for i in 1:ndims(ins[1]) if !(i in op.dims)]; srcs = Tensor[ins[1]]),)
+    (broadcast_to(ȳ, size(ins[1]), [i for i in 1:ndims(ins[1]) if !(i in op.dims)]; srcs = AbstractTensor[ins[1]]),)
 
-function reduce_sum(x::Tensor, dims)
+function reduce_sum(x::AbstractTensor, dims)
     ax = sort!(unique(Int[d for d in dims]))
     isempty(ax) && return x                              # reducing zero axes is the identity
     return apply(ReduceSumOp(ax), x)
 end
 # NOTE: reduce_sum DROPS the reduced axes (rank falls), unlike Base.sum(A; dims=)
 # which keeps them as size-1. `sum(x)` (no dims) reduces everything to a scalar.
-Base.sum(x::Tensor; dims = Colon()) =
+Base.sum(x::AbstractTensor; dims = Colon()) =
     reduce_sum(x, dims === Colon() ? (1:ndims(x)) : (dims isa Integer ? (dims,) : dims))

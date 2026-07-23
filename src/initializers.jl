@@ -21,14 +21,14 @@
 # you configure it once (gain, mean/std, fill value, …) and hand the result to a
 # Variable:
 #
-#       Tensor(Var, 240, 10; init = GlorotUniform())
-#       Tensor(Var, 10;      init = Fill(0.1))
-#       Tensor(Var, 8, 8;    init = RandN(0, 0.02))
+#       Var(GlorotUniform(), 240, 10)
+#       Var(Fill(0.1), 10)
+#       Var(RandN(0, 0.02), 8, 8)
 #
 # If none of these fit, just pass your own closure with the same signature —
 # there is nothing special about the ones defined here:
 #
-#       Tensor(Var, 8, 8; init = (rng, T, dims...) -> randn(rng, T, dims) ./ 10)
+#       Var((rng, T, dims...) -> randn(rng, T, dims) ./ 10, 8, 8)
 # =====================================================================
 
 # --- deterministic ---------------------------------------------------

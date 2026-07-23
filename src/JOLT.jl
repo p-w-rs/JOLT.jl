@@ -22,7 +22,7 @@ import Mmap                  # page-aligned arena backing `vars` for zero-copy I
 
 # Include order matters for TYPES (each file's structs must exist before a
 # later file mentions them in a field or signature): dims.jl defines Dim/Facts,
-# tensor.jl defines Tensor, ops/core.jl defines Op/OpNode (a field of Session),
+# tensor.jl defines the tensor roles, ops/core.jl defines Op/OpNode (a field of Session),
 # and session.jl's Session holds all of them. The concrete ops come AFTER
 # session.jl because their `lower` bodies call `push_op!`; ops/gradients.jl is
 # last (it walks the tape). Method *bodies* may still forward-reference
@@ -36,10 +36,9 @@ export provably_divisible, provably_ge
 include("initializers.jl")  # closure-based Variable initializers
 export Zeros, Ones, Fill, RandN, Rand, GlorotUniform, GlorotNormal
 
-include("tensor.jl")    # roles, Tensor, traits, public constructors
-export AbstractTensor, Tensor, roleof
+include("tensor.jl")    # AbstractTensor + the 4 concrete roles, traits, constructors
+export AbstractTensor, Argument, Arg, Variable, Var, Constant, Const, Result
 export getvalue
-export TensorRole, Argument, Arg, Variable, Var, Constant, Const, Result, Res
 
 include("ops/core.jl")  # Op/OpNode/apply machinery (OpNode is a Session field)
 
@@ -48,6 +47,7 @@ export Session, session, session!, new_session!, reset_session!, with_session
 export current_facts
 export default_dtype, default_dtype!
 export namespace, pushnamespace!, popnamespace!, clearnamespace!
+export getArgument, getArg, getVariable, getVar, getConstant, getConst, getTensor
 
 include("ops/basic.jl")       # add, subtract, multiply (mul), negate
 include("ops/reduce.jl")      # reduce_sum, sum

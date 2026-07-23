@@ -27,17 +27,17 @@ function vjp end
 # only knows symbolic dims as anonymous `?`).
 struct OpNode
     op::Op
-    inputs::Vector{Tensor}
+    inputs::Vector{AbstractTensor}
     ir::IR.Operation
     shape::Tuple
 end
 
-function apply(op::Op, ins::Tensor...)
+function apply(op::Op, ins::AbstractTensor...)
     allequal(eltype, ins) ||
         error("$(typeof(op)): mixed element types $(map(eltype, ins))")
     shape = outshape(op, map(size, ins)...)
     ir    = lower(op, ins...)
-    return push_op!(OpNode(op, collect(ins), ir, shape))
+    return push_op!(OpNode(op, collect(AbstractTensor, ins), ir, shape))
 end
 
 # --- MLIR attribute helpers (for ops carrying attributes) -----------

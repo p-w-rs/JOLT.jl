@@ -14,7 +14,7 @@
 # Wrap the session's graph in `func.func @main`. This FINALIZES the session:
 # its block is moved into the returned module (and a `func.return` is appended),
 # so the session should not be built into afterwards.
-function build_module(s::Session, outputs::Vector{<:Tensor}; entry::AbstractString = "main")
+function build_module(s::Session, outputs::Vector{<:AbstractTensor}; entry::AbstractString = "main")
     in_tys  = IR.Type[IR.type(t.value) for t in s.argvars]        # inputs = args + vars, in order
     out_tys = IR.Type[IR.type(o.value) for o in outputs]
     push!(s.block, funcd.return_(IR.Value[o.value for o in outputs]))

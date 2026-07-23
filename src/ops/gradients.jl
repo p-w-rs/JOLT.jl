@@ -10,20 +10,20 @@
 # A zero cotangent shaped like `x`: a constant when the shape is static, and
 # `x - x` when it's symbolic (StableHLO can't build a `?`-shaped constant, but
 # x−x is zero of exactly the right runtime shape).
-zeros_like(x::Tensor{T}) where {T} =
-    isstatic(size(x)) ? Tensor(Const, zeros(T, size(x)...)) : x - x
+zeros_like(x::AbstractTensor{T}) where {T} =
+    isstatic(size(x)) ? Constant(zeros(T, size(x)...)) : x - x
 
 # A constant-valued tensor shaped like `x` — DYNAMIC shapes included: it
 # broadcasts a scalar into `x`'s (possibly `?`) shape via dynamic_broadcast_in_dim,
 # reading the runtime sizes from `x` itself. This is how you seed a NON-scalar
 # loss (whose shape may be dynamic): `∇(y; wrt=w, seed=ones_like(y))`.
-fill_like(x::Tensor, v) = broadcast_to(Tensor(Const, fill(convert(eltype(x), v))), size(x), Int[]; srcs = Tensor[x])
-ones_like(x::Tensor)    = fill_like(x, one(eltype(x)))
+fill_like(x::AbstractTensor, v) = broadcast_to(Constant(fill(convert(eltype(x), v))), size(x), Int[]; srcs = AbstractTensor[x])
+ones_like(x::AbstractTensor)    = fill_like(x, one(eltype(x)))
 
 # --- gradient-routing ops (identity forward, custom backward) -------
 # Forward is a pass-through (optimization_barrier keeps it from being folded
 # away); only the vjp differs.
-_barrier(a::Tensor) = shlo.optimization_barrier(IR.Value[a.value]; result = IR.Type[IR.type(a.value)])
+_barrier(a::AbstractTensor) = shlo.optimization_barrier(IR.Value[a.value]; result = IR.Type[IR.type(a.value)])
 
 # stop_gradient: cut the flow — ∂/∂input = 0 (nothing behind it gets gradient
 # through this path). Used for detached targets (target nets, fixed labels).
@@ -31,7 +31,7 @@ struct StopGradient <: Op end
 outshape(::StopGradient, sa)     = sa
 lower(::StopGradient, a)         = _barrier(a)
 vjp(::StopGradient, ȳ, ins, out) = (zeros_like(ins[1]),)
-stop_gradient(a::Tensor) = apply(StopGradient(), a)
+stop_gradient(a::AbstractTensor) = apply(StopGradient(), a)
 
 # grad_reversal: identity forward, sign-flipped backward (domain-adversarial /
 # DANN). A scale factor λ awaits the broadcast layer (scalar·tensor).
@@ -39,7 +39,7 @@ struct GradReversal <: Op end
 outshape(::GradReversal, sa)     = sa
 lower(::GradReversal, a)         = _barrier(a)
 vjp(::GradReversal, ȳ, ins, out) = (neg(ȳ),)
-grad_reversal(a::Tensor) = apply(GradReversal(), a)
+grad_reversal(a::AbstractTensor) = apply(GradReversal(), a)
 
 # --- reverse-mode engine --------------------------------------------
 # `ct` maps each tensor to its accumulated ∂loss/∂tensor. The loop range is
@@ -47,8 +47,8 @@ grad_reversal(a::Tensor) = apply(GradReversal(), a)
 # emits ops) — this pass differentiates only the ops that existed at entry; the
 # new backward nodes sit above the snapshot and are (correctly) left for a
 # later ∇ call to differentiate.
-function _backprop(s::Session, loss::Tensor, seed::Tensor)
-    ct = Dict{Tensor,Tensor}()
+function _backprop(s::Session, loss::AbstractTensor, seed::AbstractTensor)
+    ct = Dict{AbstractTensor,AbstractTensor}()
     ct[loss] = seed
     for i in lastindex(s.tape):-1:firstindex(s.tape)
         node, out = s.tape[i]
@@ -63,18 +63,18 @@ function _backprop(s::Session, loss::Tensor, seed::Tensor)
     return ct
 end
 
-_ones_seed(loss::Tensor) = isempty(size(loss)) ? Tensor(Const, one(eltype(loss))) :
+_ones_seed(loss::AbstractTensor) = isempty(size(loss)) ? Constant(one(eltype(loss))) :
     error("∇ needs a scalar loss (shape $(size(loss))); reduce it to a scalar (e.g. `sum`), " *
           "or pass an explicit cotangent — e.g. `seed = ones_like(loss)` (works for dynamic shapes too).")
 
 # --- selection: which tensors to collect ----------------------------
 _hasprefix(path::Tuple, pre::Tuple) = length(path) >= length(pre) && path[1:length(pre)] == pre
-_grad(ct, t::Tensor) = get(() -> zeros_like(t), ct, t)
+_grad(ct, t::AbstractTensor) = get(() -> zeros_like(t), ct, t)
 
 # The return MIRRORS `wrt`: a tensor → a tensor; a vector of tensors → an
 # aligned vector; a scope prefix (Symbol / Vector{Symbol}) → a path-keyed Dict.
-_collect(s, t::Tensor, ct)                    = _grad(ct, t)
-_collect(s, ts::AbstractVector{<:Tensor}, ct) = Tensor[_grad(ct, t) for t in ts]
+_collect(s, t::AbstractTensor, ct)                    = _grad(ct, t)
+_collect(s, ts::AbstractVector{<:AbstractTensor}, ct) = AbstractTensor[_grad(ct, t) for t in ts]
 _collect(s, sym::Symbol, ct)                  = _collect(s, (sym,), ct)
 _collect(s, v::AbstractVector{Symbol}, ct)    = _collect(s, Tuple(v), ct)
 function _collect(s, pre::Tuple{Vararg{Symbol}}, ct)
@@ -92,14 +92,14 @@ Reverse-mode gradient of scalar `loss`. `wrt` selects what to differentiate
 against and shapes the result:
   :variables            → every variable            → Dict(path => grad)
   [:variables, :params] → variables under `params`  → Dict(path => grad)
-  W                     → that tensor               → a single grad Tensor
+  W                     → that tensor               → a single grad tensor
   [W, b]                → those tensors              → aligned Vector
 
 Gradients are graph tensors — feed them into more ops and call `∇` again for
 higher order. Pass `seed` (a cotangent shaped like `loss`) for a non-scalar
 vector-Jacobian product.
 """
-function ∇(loss::Tensor; wrt = :variables, seed::Tensor = _ones_seed(loss))
+function ∇(loss::AbstractTensor; wrt = :variables, seed::AbstractTensor = _ones_seed(loss))
     s = session()
     _owned(s, loss) || error("∇: `loss` belongs to a different session than the active one")
     _samedims("∇ seed", size(seed), size(loss))    # a seed is a cotangent of loss — same shape

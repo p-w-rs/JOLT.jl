@@ -43,7 +43,7 @@ end
 function _materialize_vars(s::Session, base::Integer)
     pairs = Pair{Any,Any}[]
     for (path, t) in s.names
-        roleof(t) === Variable || continue
+        t isa Variable || continue
         arr = initializer(t)(variable_rng(base, path), eltype(t), size(t)...)
         push!(pairs, path[2:end] => arr)              # drop the :variables head
     end
@@ -92,11 +92,11 @@ end
 
 # The compiled @main takes ONLY the Arguments (Variables come via the provider).
 # For each Argument in graph/block order, the index into the user's `inputs`.
-function _arg_plan(s::Session, inputs::Vector{<:Tensor})
+function _arg_plan(s::Session, inputs::Vector{<:AbstractTensor})
     argidx = IdDict(t => i for (i, t) in enumerate(inputs))
     plan = Int[]
     for t in s.argvars
-        roleof(t) === Argument || continue
+        t isa Argument || continue
         haskey(argidx, t) || error("compile: an Argument feeds the graph but isn't in `inputs`")
         push!(plan, argidx[t])
     end
@@ -110,7 +110,7 @@ function _var_layout(s::Session, vars::ComponentArray)
     base = UInt(pointer(getdata(vars))); T = eltype(vars)
     layout = Dict{Tuple,Tuple{Int,Int}}()
     for (path, t) in s.names
-        roleof(t) === Variable || continue
+        t isa Variable || continue
         capath = path[2:end]
         sub = foldl(getproperty, capath; init = vars)
         layout[capath] = (Int((UInt(pointer(sub)) - base) ÷ sizeof(T)), length(sub))
@@ -125,7 +125,7 @@ end
 # the filed IREE issue), slices each Variable out of the flat arena, and calls the
 # graph. Variables reach the graph via the provider, so @main's inputs are only
 # the Arguments.
-function _dflat_text(s::Session, graph_mod::IR.Module, outputs::Vector{<:Tensor},
+function _dflat_text(s::Session, graph_mod::IR.Module, outputs::Vector{<:AbstractTensor},
                      vars::ComponentArray, layout::Dict{Tuple,Tuple{Int,Int}})
     T = eltype(vars); elt = _eltstr(T)
     tot = length(getdata(vars)); flatty = "tensor<$(tot)x$(elt)>"
@@ -137,7 +137,7 @@ function _dflat_text(s::Session, graph_mod::IR.Module, outputs::Vector{<:Tensor}
     graph_func = replace(graph_func, "func.func @__jolt_graph" =>
                                      "func.func private @__jolt_graph"; count = 1)
 
-    args   = [t for t in s.argvars if roleof(t) === Argument]
+    args   = [t for t in s.argvars if t isa Argument]
     argno  = IdDict(t => k - 1 for (k, t) in enumerate(args))
     argsig = join(("%a$(argno[t]): $(_tystr(eltype(t), size(t)))" for t in args), ", ")
     outtys = [_tystr(eltype(o), size(o)) for o in outputs]
@@ -149,7 +149,7 @@ function _dflat_text(s::Session, graph_mod::IR.Module, outputs::Vector{<:Tensor}
     callparams = String[]; callptys = String[]; varno = 0
     for t in s.argvars
         push!(callptys, _tystr(eltype(t), size(t)))
-        if roleof(t) === Argument
+        if t isa Argument
             push!(callparams, "%a$(argno[t])")
         else
             off, len = layout[path_of[t][2:end]]
@@ -176,8 +176,8 @@ function _dflat_text(s::Session, graph_mod::IR.Module, outputs::Vector{<:Tensor}
         "  }\n}\n")
 end
 
-function compile(rng, inputs::Vector{<:Tensor}, outputs::Vector{<:Tensor}; backend::IREEBackend = IREE_CPU)
-    all(roleof(t) === Argument for t in inputs) ||
+function compile(rng, inputs::Vector{<:AbstractTensor}, outputs::Vector{<:AbstractTensor}; backend::IREEBackend = IREE_CPU)
+    all(t isa Argument for t in inputs) ||
         error("compile: `inputs` must be Argument tensors")
     s       = session()
     vars    = _materialize_vars(s, _seed_base(rng))
@@ -205,6 +205,6 @@ function (f::CompiledFn)(vars, args...)
 end
 
 "The graph as StableHLO text — `compile` without a backend."
-export_stablehlo(inputs::Vector{<:Tensor}, outputs::Vector{<:Tensor}) =
-    (all(roleof(t) === Argument for t in inputs) || error("export: `inputs` must be Argument tensors");
+export_stablehlo(inputs::Vector{<:AbstractTensor}, outputs::Vector{<:AbstractTensor}) =
+    (all(t isa Argument for t in inputs) || error("export: `inputs` must be Argument tensors");
      stablehlo_text(build_module(session(), outputs)))

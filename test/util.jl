@@ -2,11 +2,11 @@
 # Shared test helpers.
 # =====================================================================
 
-# Read the MLIR ranked-tensor type behind a Tensor's SSA value back out as
+# Read the MLIR ranked-tensor type behind a tensor's SSA value back out as
 # (julia eltype, dims). Symbolic dims come back as the marker `:dyn` — the IR
 # only knows them as anonymous `?`, so we can't recover the DimVar name here.
 # Lets a test assert the emitted IR matches the Julia-side shape/dtype, not just
-# that the Tensor handle claims to.
+# that the tensor handle claims to.
 function mlir_ranked(t)
     ty = JOLT.IR.type(t.value)
     @assert JOLT.IR.hasrank(ty) "expected a ranked tensor type"

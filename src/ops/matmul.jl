@@ -49,8 +49,8 @@ function lower(::MatMulOp, a, b)
 end
 
 # swap the last two dims, batch dims fixed — the batched transpose (Bᵀ).
-_swaplast(t::Tensor) = (R = ndims(t); permutedims(t, (1:R-2..., R, R-1)))
+_swaplast(t::AbstractTensor) = (R = ndims(t); permutedims(t, (1:R-2..., R, R-1)))
 
 vjp(::MatMulOp, ȳ, ins, out) = (ȳ * _swaplast(ins[2]), _swaplast(ins[1]) * ȳ)
 
-Base.:*(a::Tensor, b::Tensor) = apply(MatMulOp(), a, b)
+Base.:*(a::AbstractTensor, b::AbstractTensor) = apply(MatMulOp(), a, b)

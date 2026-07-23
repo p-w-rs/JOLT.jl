@@ -20,9 +20,9 @@ lower(op::TransposeOp, a)     = shlo.transpose(a.value;   # remap Julia perm int
     permutation = i64array([length(op.perm) - p for p in reverse(op.perm)]))
 vjp(op::TransposeOp, ȳ, ins, out) = (apply(TransposeOp(invperm(op.perm)), ȳ),)
 
-Base.permutedims(a::Tensor, perm) = apply(TransposeOp(collect(Int, perm)), a)
-Base.permutedims(a::Tensor)       = permutedims(a, reverse(1:ndims(a)))
-Base.adjoint(a::Tensor)           = permutedims(a)          # real tensors: adjoint ≡ transpose
+Base.permutedims(a::AbstractTensor, perm) = apply(TransposeOp(collect(Int, perm)), a)
+Base.permutedims(a::AbstractTensor)       = permutedims(a, reverse(1:ndims(a)))
+Base.adjoint(a::AbstractTensor)           = permutedims(a)  # real tensors: adjoint ≡ transpose
 
 # --- reshape --------------------------------------------------------
 struct ReshapeOp <: Op
@@ -44,7 +44,7 @@ end
 lower(op::ReshapeOp, a) = shlo.reshape(a.value; result_0 = mlir_type(eltype(a), op.shape))
 vjp(op::ReshapeOp, ȳ, ins, out) = (apply(ReshapeOp(size(ins[1])), ȳ),)   # reshape back
 
-Base.reshape(a::Tensor, dims::Union{Integer,Symbol,Poly}...) =
+Base.reshape(a::AbstractTensor, dims::Union{Integer,Symbol,Poly}...) =
     apply(ReshapeOp(map(todim, dims)), a)
 
 # =====================================================================
@@ -63,7 +63,7 @@ struct BroadcastToOp <: Op
     bdims::Vector{Int}     # 1-based: input dim i -> target dim bdims[i]
     # DYNAMIC broadcast plan (empty ⇒ fully static, lower via broadcast_in_dim):
     # one entry per target axis (Julia order) giving its runtime size — a static
-    # Int, or (src::Tensor, src_julia_axis) to read at run time via
+    # Int, or (src::AbstractTensor, src_julia_axis) to read at run time via
     # get_dimension_size. Set by `broadcast_to` when a dynamic target axis isn't
     # supplied by the operand itself. See `broadcast_to`.
     dynsize::Vector{Any}
@@ -132,7 +132,7 @@ end
 # `srcs` are tensors whose axes can supply the RUNTIME SIZE of a dynamic target
 # axis that the operand `x` doesn't itself carry (e.g. a bias/seed broadcast over
 # a :B batch — the size lives in a sibling tensor). Matched by Dim identity.
-function broadcast_to(x::Tensor, shape, bdims; srcs::AbstractVector = Tensor[])
+function broadcast_to(x::AbstractTensor, shape, bdims; srcs::AbstractVector = AbstractTensor[])
     shape = Tuple(shape); bdims = collect(Int, bdims)
     (shape == size(x) && bdims == collect(1:ndims(x))) && return x       # no-op broadcast
     sa = size(x); n = length(shape)
@@ -164,22 +164,22 @@ end
 # left-pad (NumPy) alignment: a rank-`ra` input maps to the TRAILING `ra` axes.
 _trailing_bdims(ra, n) = collect((n - ra + 1):n)
 
-function _bcast(f, a::Tensor, b::Tensor)
+function _bcast(f, a::AbstractTensor, b::AbstractTensor)
     s = broadcast_shapes(size(a), size(b))
     n = length(s)
     # Either operand may supply a dynamic axis the other lacks (e.g. bias over :B).
-    return f(broadcast_to(a, s, _trailing_bdims(ndims(a), n); srcs = Tensor[a, b]),
-             broadcast_to(b, s, _trailing_bdims(ndims(b), n); srcs = Tensor[a, b]))
+    return f(broadcast_to(a, s, _trailing_bdims(ndims(a), n); srcs = AbstractTensor[a, b]),
+             broadcast_to(b, s, _trailing_bdims(ndims(b), n); srcs = AbstractTensor[a, b]))
 end
 
 # More specific than Base's generic `broadcasted`, so these intercept .+/.-/.*
 # before Julia's array-broadcast path can engage.
-Base.broadcasted(::typeof(+), a::Tensor, b::Tensor) = _bcast(+, a, b)
-Base.broadcasted(::typeof(-), a::Tensor, b::Tensor) = _bcast(-, a, b)
-Base.broadcasted(::typeof(*), a::Tensor, b::Tensor) = _bcast(mul, a, b)
-_scalar(a::Tensor{T}, x::Real) where {T} = Tensor(Const, fill(convert(T, x)))
-Base.broadcasted(f::Union{typeof(+),typeof(-),typeof(*)}, a::Tensor, x::Real) = Base.broadcasted(f, a, _scalar(a, x))
-Base.broadcasted(f::Union{typeof(+),typeof(-),typeof(*)}, x::Real, a::Tensor) = Base.broadcasted(f, _scalar(a, x), a)
+Base.broadcasted(::typeof(+), a::AbstractTensor, b::AbstractTensor) = _bcast(+, a, b)
+Base.broadcasted(::typeof(-), a::AbstractTensor, b::AbstractTensor) = _bcast(-, a, b)
+Base.broadcasted(::typeof(*), a::AbstractTensor, b::AbstractTensor) = _bcast(mul, a, b)
+_scalar(a::AbstractTensor{T}, x::Real) where {T} = Constant(fill(convert(T, x)))
+Base.broadcasted(f::Union{typeof(+),typeof(-),typeof(*)}, a::AbstractTensor, x::Real) = Base.broadcasted(f, a, _scalar(a, x))
+Base.broadcasted(f::Union{typeof(+),typeof(-),typeof(*)}, x::Real, a::AbstractTensor) = Base.broadcasted(f, _scalar(a, x), a)
 # Unsupported dotted ops (./ .^) and Array operands still error — via Julia's
 # generic path — rather than silently doing the wrong thing. Curated messages
-# for those would need a dedicated Tensor BroadcastStyle (deferred).
+# for those would need a dedicated tensor BroadcastStyle (deferred).

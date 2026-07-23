@@ -24,14 +24,14 @@ struct AddOp <: Op end
 outshape(::AddOp, sa, sb) = _samedims("+", sa, sb)
 lower(::AddOp, a, b)      = shlo.add(a.value, b.value)
 vjp(::AddOp, ȳ, ins, out) = (ȳ, ȳ)
-Base.:+(a::Tensor, b::Tensor) = apply(AddOp(), a, b)
+Base.:+(a::AbstractTensor, b::AbstractTensor) = apply(AddOp(), a, b)
 
 # --- subtract (elementwise):  d(a-b) = (ȳ, -ȳ) ------------------------------------
 struct SubOp <: Op end
 outshape(::SubOp, sa, sb) = _samedims("-", sa, sb)
 lower(::SubOp, a, b)      = shlo.subtract(a.value, b.value)
 vjp(::SubOp, ȳ, ins, out) = (ȳ, neg(ȳ))
-Base.:-(a::Tensor, b::Tensor) = apply(SubOp(), a, b)
+Base.:-(a::AbstractTensor, b::AbstractTensor) = apply(SubOp(), a, b)
 
 # --- multiply (elementwise):  d(a·b) = (ȳ·b, ȳ·a) -------------------
 # Each input's cotangent reads the OTHER forward input — why tape nodes keep
@@ -40,12 +40,12 @@ struct MulOp <: Op end
 outshape(::MulOp, sa, sb) = _samedims("mul", sa, sb)
 lower(::MulOp, a, b)      = shlo.multiply(a.value, b.value)
 vjp(::MulOp, ȳ, ins, out) = (mul(ȳ, ins[2]), mul(ȳ, ins[1]))
-mul(a::Tensor, b::Tensor) = apply(MulOp(), a, b)
+mul(a::AbstractTensor, b::AbstractTensor) = apply(MulOp(), a, b)
 
 # --- negate (unary):  d(-a) = -ȳ ------------------------------------
 struct NegOp <: Op end
 outshape(::NegOp, sa)     = sa
 lower(::NegOp, a)         = shlo.negate(a.value)
 vjp(::NegOp, ȳ, ins, out) = (neg(ȳ),)
-neg(a::Tensor) = apply(NegOp(), a)
-Base.:-(a::Tensor) = neg(a)
+neg(a::AbstractTensor) = apply(NegOp(), a)
+Base.:-(a::AbstractTensor) = neg(a)
