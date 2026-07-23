@@ -59,10 +59,11 @@ function iree_build(backend::IREEBackend, text::AbstractString)
     return IREEExecutable(vmfb, backend.driver, C_NULL)
 end
 
-# Column-major Julia array → row-major flat bytes (and back). This transpose is
-# the boundary copy the zero-copy phase eliminates.
-_rowmajor(a::AbstractArray)          = vec(permutedims(a, reverse(1:ndims(a))))
-_rowmajor(a::AbstractArray{<:Any,0}) = collect(vec(a))
+# Contiguous column-major bytes of `a`. With the reverse-dims graph these bytes
+# ARE the row-major tensor IREE wants — no transpose. (Dense arrays share memory;
+# views are materialized. The zero-copy shim will import a dense array's pointer.)
+_flat(a::Array)         = vec(a)
+_flat(a::AbstractArray) = vec(Array(a))
 
 "Run the program on `inputs` (host arrays, in func-signature order) → output host arrays."
 function iree_run(e::IREEExecutable, inputs::Vector)
@@ -76,7 +77,7 @@ function iree_run(e::IREEExecutable, inputs::Vector)
     try
         for x in inputs
             arr = x isa AbstractArray ? x : fill(x)
-            data = _rowmajor(arr); dims = Int64[size(arr)...]
+            data = _flat(arr); dims = Int64[reverse(size(arr))...]   # reversed dims (see mlir_type)
             rc = GC.@preserve data dims ccall(_sym[:jolt_push_input], Cint,
                 (Ptr{Cvoid}, Cint, Cint, Ptr{Int64}, Ptr{Cvoid}, Int64),
                 call, Cint(_ecode(eltype(arr))), Cint(ndims(arr)),
@@ -93,7 +94,9 @@ function iree_run(e::IREEExecutable, inputs::Vector)
             GC.@preserve buf ccall(_sym[:jolt_output_read], Cint,
                 (Ptr{Cvoid}, Ptr{Cvoid}, Int64), call, pointer(buf), Int64(sizeof(buf))) == 0 ||
                 error("IREE: output_read failed")
-            push!(outs, r == 0 ? buf[1] : permutedims(reshape(buf, reverse(shp)...), reverse(1:r)))
+            # IREE reports the reversed shape; reshape the row-major bytes to the Julia
+            # shape (its reverse) — a column-major reshape reinterprets them, no transpose.
+            push!(outs, r == 0 ? buf[1] : reshape(buf, reverse(shp)...))
         end
         return outs
     finally

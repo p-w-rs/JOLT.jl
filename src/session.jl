@@ -181,8 +181,14 @@ end
 # Julia shape (Int | symbolic Dim) -> MLIR ranked tensor type. Symbolic dims
 # collapse to MLIR's anonymous `?` (dim_to_mlir); their identity lives only in
 # the Dim algebra, not in the IR.
+# REVERSE-DIMS: MLIR/StableHLO/IREE are row-major; Julia is column-major. A
+# Julia column-major (m,n) buffer is byte-identical to a row-major (n,m) tensor,
+# so we build every MLIR type with the shape REVERSED. This is what lets the
+# host↔IREE boundary be copy-free (no transpose): the whole graph lives in
+# reversed-dim space, and the shape rules (Julia order) reverse only here at the
+# lowering edge. Ops that name a dimension remap Julia axis i → MLIR axis N-i.
 mlir_type(::Type{T}, shape) where {T} =
-    IR.TensorType(Int[dim_to_mlir(d) for d in shape], IR.Type(T))
+    IR.TensorType(Int[dim_to_mlir(d) for d in reverse(shape)], IR.Type(T))
 
 function push_arg!(::Type{T}, shape::NTuple{N,Dim}; name=nothing) where {T,N}
     for d in shape                              # a negative Int would mint invalid MLIR
@@ -268,10 +274,10 @@ function push_op!(n::OpNode)
     N = length(n.shape)
     IR.ndims(type) == N ||
         error("shape rule bug in $(typeof(n.op)): JOLT computed rank $N, StableHLO inferred $(IR.ndims(type))")
-    for i in 1:N
-        mlir_ok(n.shape[i], IR.size(type, i)) ||
+    for i in 1:N                                   # MLIR type is reversed (see mlir_type)
+        mlir_ok(n.shape[i], IR.size(type, N - i + 1)) ||
             error("shape rule bug in $(typeof(n.op)): JOLT computed dim $i = $(n.shape[i]), " *
-                  "StableHLO inferred $(Int(IR.size(type, i)))")
+                  "StableHLO inferred $(Int(IR.size(type, N - i + 1)))")
     end
     path = _resolve!(s, Result, nothing)          # results never collide; resolve, then append
     push!(s.block, n.ir)

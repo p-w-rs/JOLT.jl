@@ -39,7 +39,7 @@ function lower(op::ReduceSumOp, x)
     return shlo.reduce(
         IR.Value[x.value], IR.Value[IR.result(init, 1)];
         result_0   = IR.Type[mlir_type(T, outshape(op, size(x)))],
-        dimensions = i64array(op.dims .- 1),           # 0-based
+        dimensions = i64array(sort!([ndims(x) - d for d in op.dims])),   # Julia axis d → MLIR axis N-d
         body       = _reduce_region(T),
     )
 end

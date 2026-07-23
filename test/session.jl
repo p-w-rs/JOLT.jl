@@ -249,16 +249,18 @@
 
     @testset "mlir_type builder (internal)" begin
         new_session!()                      # needs an active context
+        # mlir_type REVERSES the shape (row-major; see its reverse-dims note):
+        # Julia (2,3) → MLIR 3×2.
         ty = JOLT.mlir_type(Float32, (2, 3))
         @test JOLT.IR.hasrank(ty)
         @test JOLT.IR.julia_type(JOLT.IR.eltype(ty)) == Float32
         @test JOLT.IR.ndims(ty) == 2
-        @test Int(JOLT.IR.size(ty, 1)) == 2
-        @test Int(JOLT.IR.size(ty, 2)) == 3
+        @test Int(JOLT.IR.size(ty, 1)) == 3              # reversed
+        @test Int(JOLT.IR.size(ty, 2)) == 2
 
-        dyn = JOLT.mlir_type(Float32, (8, todim(:N)))
-        @test !JOLT.IR.isdynsize(JOLT.IR.size(dyn, 1))   # static dim stays
-        @test JOLT.IR.isdynsize(JOLT.IR.size(dyn, 2))    # symbolic dim -> ?
+        dyn = JOLT.mlir_type(Float32, (8, todim(:N)))    # → MLIR ?×8
+        @test JOLT.IR.isdynsize(JOLT.IR.size(dyn, 1))    # symbolic :N -> ? (now first)
+        @test !JOLT.IR.isdynsize(JOLT.IR.size(dyn, 2))   # static 8 (now second)
     end
 
 end

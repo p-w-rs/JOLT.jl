@@ -28,17 +28,24 @@ function outshape(::MatMulOp, sa, sb)
     return (sa[1:end-2]..., sa[end-1], sb[end])
 end
 
-# dot_general dimension numbers for rank R: batch dims 0…R-3, contract A[R-1]·B[R-2].
-_dotdims(R::Int) = (b = join(0:R-3, ", ");
-    "#stablehlo.dot<lhs_batching_dimensions = [$b], rhs_batching_dimensions = [$b], " *
-    "lhs_contracting_dimensions = [$(R-1)], rhs_contracting_dimensions = [$(R-2)]>")
-
+# In reversed-dim space A_mlir=(k,m,rev_b…), B_mlir=(n,k,rev_b…). dot_general puts
+# batch dims FIRST, so we swap operands (lhs=B, rhs=A) to get n before m, and for
+# R>2 transpose the batch dims from the front to the back — dot_general → (rev_b…,
+# n, m), then reorder to (n, m, rev_b…) = reversed(b…, m, n).
 function lower(::MatMulOp, a, b)
-    R = ndims(a)
-    out = (size(a)[1:end-2]..., size(a, R-1), size(b, R))
-    shlo.dot_general(a.value, b.value;
-        result_0 = mlir_type(eltype(a), out),
-        dot_dimension_numbers = ir_attr(_dotdims(R)))
+    R = ndims(a); T = eltype(a)
+    batch = join(2:R-1, ", ")                       # MLIR batch axes (empty for R=2)
+    dn = "#stablehlo.dot<lhs_batching_dimensions = [$batch], rhs_batching_dimensions = [$batch], " *
+         "lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0]>"
+    m = size(a, R-1); n = size(b, R); revb = reverse(size(a)[1:end-2])
+    dot = shlo.dot_general(b.value, a.value;        # swapped: lhs = B, rhs = A
+        result_0 = IR.TensorType(Int[dim_to_mlir(d) for d in (revb..., n, m)], IR.Type(T)),
+        dot_dimension_numbers = ir_attr(dn))
+    R == 2 && return dot                             # (n, m) = reversed (m, n): the only op
+    push!(session().block, dot)                      # batched: dot is auxiliary — append it here,
+    return shlo.transpose(IR.result(dot, 1);         # then return the reorder (rev_b…,n,m) → (n,m,rev_b…)
+        result = mlir_type(T, (size(a)[1:end-2]..., m, n)),
+        permutation = i64array([R - 2, R - 1, (0:R-3)...]))
 end
 
 # swap the last two dims, batch dims fixed — the batched transpose (Bᵀ).

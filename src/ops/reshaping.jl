@@ -16,7 +16,8 @@ function outshape(op::TransposeOp, sa)
         error("transpose: $(op.perm) is not a permutation of 1:$(length(sa))")
     return ntuple(i -> sa[op.perm[i]], length(op.perm))
 end
-lower(op::TransposeOp, a)     = shlo.transpose(a.value; permutation = i64array(op.perm .- 1))
+lower(op::TransposeOp, a)     = shlo.transpose(a.value;   # remap Julia perm into reversed-dim space
+    permutation = i64array([length(op.perm) - p for p in reverse(op.perm)]))
 vjp(op::TransposeOp, ȳ, ins, out) = (apply(TransposeOp(invperm(op.perm)), ȳ),)
 
 Base.permutedims(a::Tensor, perm) = apply(TransposeOp(collect(Int, perm)), a)
@@ -89,8 +90,8 @@ function outshape(op::BroadcastToOp, sa)
     return op.shape
 end
 lower(op::BroadcastToOp, x) = shlo.broadcast_in_dim(x.value;
-    result_0 = mlir_type(eltype(x), op.shape),
-    broadcast_dimensions = i64array(op.bdims .- 1))
+    result_0 = mlir_type(eltype(x), op.shape),        # input dim i → output dim bdims[i], in reversed space
+    broadcast_dimensions = i64array([length(op.shape) - b for b in reverse(op.bdims)]))
 # backward: sum ȳ over the axes that were replicated (new) or stretched (input
 # was size-1), then reshape back so the input's size-1 dims are restored.
 function vjp(op::BroadcastToOp, ȳ, ins, out)

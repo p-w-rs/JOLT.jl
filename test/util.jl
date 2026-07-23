@@ -15,5 +15,7 @@ function mlir_ranked(t)
         sz = JOLT.IR.size(ty, i)
         JOLT.IR.isdynsize(sz) ? :dyn : Int(sz)
     end
-    return T, dims
+    # The emitted MLIR type is REVERSED (row-major; see mlir_type's reverse-dims
+    # note). Report it back in Julia order so shape assertions read naturally.
+    return T, reverse(dims)
 end
