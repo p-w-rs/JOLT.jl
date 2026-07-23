@@ -688,6 +688,9 @@ dim_to_mlir(::Poly) = IR.dynsize()
 
 mlir_ok(ours::Dim, sz) = !(ours isa Int) || IR.isdynsize(sz) || ours == Int(sz)
 
+# A shape is static iff every dim is a concrete Int (no symbolic Poly dims).
+isstatic(dims) = all(d -> d isa Int, dims)
+
 # ---------------------------------------------------------------------
 # Session-facts conveniences. `current_facts()` (defined in session.jl, the
 # single point of session access) supplies the active session's Facts, so

@@ -97,11 +97,13 @@
         @test size(t)    == (4, 5)
         @test size(t, 1) == 4
         @test size(t, 2) == 5
+        @test size(t, 5) == 1               # trailing/out-of-range dim reads as 1 (Base semantics)
         @test length(t)  == 20
         @test ndims(t)   == 2
 
         sc = Tensor()                       # scalar: prod(()) == 1
         @test size(sc)   == ()
+        @test size(sc, 1) == 1              # scalar: any dim is 1, not a BoundsError
         @test length(sc) == 1
 
         dyn = Tensor(Float32, 8, :N)
@@ -174,6 +176,12 @@
 
         g = GlorotUniform()(rng(), Float32, 4, 5)
         @test eltype(g) == Float32 && size(g) == (4, 5)
+
+        # rank-0 (scalar) inits must still return Array{T,0}, like the deterministic ones
+        @test Zeros()(rng(), Float32)        isa Array{Float32,0}
+        @test RandN()(rng(), Float32)        isa Array{Float32,0}
+        @test Rand()(rng(), Float32)         isa Array{Float32,0}
+        @test GlorotNormal()(rng(), Float32) isa Array{Float32,0}
 
         # a Variable stores the initializer function unevaluated
         new_session!()

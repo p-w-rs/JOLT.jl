@@ -186,9 +186,11 @@
         @test haskey(s.names, (:constants, :default, :_1))
 
         # duplicate names within a scope are rejected; misses error
-        new_session!()
+        s = new_session!()
         Tensor(2; name="dup")
+        nargv, nnames = length(s.argvars), length(s.names)
         @test_throws ErrorException Tensor(2; name="dup")
+        @test length(s.argvars) == nargv && length(s.names) == nnames  # rejected name leaves NO orphan state
         @test_throws ErrorException JOLT.lookup((:missing,))
 
         # string lookup returns the very same handle

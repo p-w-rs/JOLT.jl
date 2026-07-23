@@ -28,7 +28,7 @@
 # If none of these fit, just pass your own closure with the same signature —
 # there is nothing special about the ones defined here:
 #
-#       Tensor(Var, 8, 8; init = (rng, T, dims...) -> randn(rng, T, dims...) ./ 10)
+#       Tensor(Var, 8, 8; init = (rng, T, dims...) -> randn(rng, T, dims) ./ 10)
 # =====================================================================
 
 # --- deterministic ---------------------------------------------------
@@ -39,15 +39,21 @@ Ones()  = (rng::AbstractRNG, T::Type, dims::Integer...) -> ones(T, dims...)
 Fill(value::Real) = (rng::AbstractRNG, T::Type, dims::Integer...) -> fill(convert(T, value), dims...)
 
 # --- random ----------------------------------------------------------
+# A rank-0 draw is Array{T,0}, but an affine broadcast (a .* x .+ b) collapses a
+# 0-dim array back to a scalar — `_asarray` re-wraps it so every initializer
+# honors the `-> Array{T}` contract for scalar Variables too.
+_asarray(x::AbstractArray) = x
+_asarray(x) = fill(x)
+
 """Normal draws with the given `mean` and standard deviation `std`."""
 RandN(mean::Real = 0, std::Real = 1) =
     (rng::AbstractRNG, T::Type, dims::Integer...) ->
-        convert(T, std) .* randn(rng, T, dims...) .+ convert(T, mean)
+        _asarray(convert(T, std) .* randn(rng, T, dims) .+ convert(T, mean))
 
 """Uniform draws on the half-open interval `[lo, hi)`."""
 Rand(lo::Real = 0, hi::Real = 1) =
     (rng::AbstractRNG, T::Type, dims::Integer...) ->
-        convert(T, lo) .+ (convert(T, hi) - convert(T, lo)) .* rand(rng, T, dims...)
+        _asarray(convert(T, lo) .+ (convert(T, hi) - convert(T, lo)) .* rand(rng, T, dims))
 
 # fan-in / fan-out for the Glorot/He family: everything but the last dim feeds
 # in, the last dim is the output width. (Scalars/vectors degrade gracefully.)
@@ -60,7 +66,7 @@ function GlorotUniform(gain::Real = 1)
     return (rng::AbstractRNG, T::Type, dims::Integer...) -> begin
         fan_in, fan_out = _fan(dims)
         limit = convert(T, gain) * sqrt(convert(T, 6) / convert(T, fan_in + fan_out))
-        return (rand(rng, T, dims...) .* (2 * limit)) .- limit
+        return _asarray((rand(rng, T, dims) .* (2 * limit)) .- limit)
     end
 end
 
@@ -69,6 +75,6 @@ function GlorotNormal(gain::Real = 1)
     return (rng::AbstractRNG, T::Type, dims::Integer...) -> begin
         fan_in, fan_out = _fan(dims)
         std = convert(T, gain) * sqrt(convert(T, 2) / convert(T, fan_in + fan_out))
-        return std .* randn(rng, T, dims...)
+        return _asarray(std .* randn(rng, T, dims))
     end
 end

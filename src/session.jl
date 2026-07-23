@@ -153,15 +153,18 @@ popnamespace!()    = (isempty(session().scope) && error("namespace stack empty")
 clearnamespace!()  = (empty!(session().scope); nothing)
 namespace(f, n)    = (pushnamespace!(n); try f() finally popnamespace!() end)
 
-# register! / lookup implement the (role, scope..., leaf) path rule above.
-function register!(s::Session, t::Tensor, name)
-    role = Symbol(lowercase(string(roleof(t))), 's')
-    anon = get!(() -> Ref(0), s.anon, role)
-    leaf = name === nothing ? Symbol('_', anon[] += 1) : Symbol(name)
+# _resolve! computes the (role, scope..., leaf) path and rejects a duplicate name
+# BEFORE any IR mutation — so a rejected name leaves the session untouched, the
+# same transactional guarantee push_op! gives for a rejected op. The role is
+# known statically (no built tensor, hence no emitted IR, is needed to resolve
+# it); the builder commits `s.names[path] = t` only after the IR is built.
+function _resolve!(s::Session, role_enum::TensorRole, name)
+    role = Symbol(lowercase(string(role_enum)), 's')
+    ctr  = get!(() -> Ref(0), s.anon, role)                # ensure the per-role counter exists
+    leaf = name === nothing ? Symbol('_', ctr[] += 1) : Symbol(name)   # anon leaves never collide
     path = (role, effective_scope()..., leaf)
     haskey(s.names, path) && error("name already bound: \"", join(path, "/"), "\"")
-    s.names[path] = t
-    return t
+    return path
 end
 
 function lookup(path::Tuple{Vararg{Symbol}})
@@ -187,10 +190,11 @@ function push_arg!(::Type{T}, shape::NTuple{N,Dim}; name=nothing) where {T,N}
             error("invalid dimension $d: concrete dims must be ≥ 0 (use a Symbol for a runtime dim)")
     end
     s = session()
+    path  = _resolve!(s, Argument, name)          # collision check BEFORE mutating the block
     value = IR.push_argument!(s.block, mlir_type(T, shape))
     t = Tensor{T,N,Argument}(value, shape, nothing)
     push!(s.argvars, t)
-    register!(s, t, name)
+    s.names[path] = t
     return t
 end
 
@@ -211,10 +215,11 @@ function push_var!(init, ::Type{T}, dims::NTuple{N,Int}; name=nothing) where {T,
         d < 0 && error("invalid dimension $d: variable dims must be ≥ 0")
     end
     s = session()
+    path  = _resolve!(s, Variable, name)          # collision check BEFORE mutating the block
     value = IR.push_argument!(s.block, mlir_type(T, dims))
     t = Tensor{T,N,Variable}(value, dims, init)
     push!(s.argvars, t)
-    register!(s, t, name)
+    s.names[path] = t
     return t
 end
 
@@ -224,10 +229,11 @@ end
 # raw numeric data.)
 function push_constant!(data::Array{T,N}; name=nothing) where {T,N}
     s = session()
+    path = _resolve!(s, Constant, name)           # collision check BEFORE mutating the block
     op = shlo.constant(; value=IR.DenseElementsAttribute(data), output=mlir_type(T, size(data)))
     push!(s.block, op)
     t = Tensor{T,N,Constant}(IR.result(op, 1), size(data), data)   # keep the value for getvalue
-    register!(s, t, name)
+    s.names[path] = t
     return t
 end
 
@@ -267,9 +273,10 @@ function push_op!(n::OpNode)
             error("shape rule bug in $(typeof(n.op)): JOLT computed dim $i = $(n.shape[i]), " *
                   "StableHLO inferred $(Int(IR.size(type, i)))")
     end
+    path = _resolve!(s, Result, nothing)          # results never collide; resolve, then append
     push!(s.block, n.ir)
     t = Tensor{T,N,Result}(value, Tuple(n.shape), nothing)
     push!(s.tape, (n, t))
-    register!(s, t, nothing)
+    s.names[path] = t
     return t
 end

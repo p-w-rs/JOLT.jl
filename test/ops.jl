@@ -242,4 +242,28 @@ JOLT.lower(::BadRankOp, a::Tensor, b::Tensor) = JOLT.shlo.add(a.value, b.value)
         @test all(t -> size(t) == (todim(:B), 8), cts)
     end
 
+    # -----------------------------------------------------------------
+    # subtract & negate: forward, same-shape rule, and vjps.
+    #   d(a-b) = (ȳ, -ȳ)      d(-a) = -ȳ
+    # -----------------------------------------------------------------
+    @testset "subtract & negate" begin
+        s = new_session!()
+        x = Tensor(2, 3)
+        y = Tensor(2, 3)
+        @test size(x - y) == (2, 3)
+        @test size(-x) == (2, 3)                             # unary minus = negate
+        @test_throws ErrorException Tensor(2, 3) - Tensor(3, 2)   # same-shape only
+
+        # sub vjp: (ȳ, -ȳ) — the second cotangent is a fresh NegOp node
+        ȳ = Tensor(2, 3)
+        n0 = length(s.tape)
+        cts = JOLT.vjp(JOLT.SubOp(), ȳ, [x, y], x - y)
+        @test cts[1] === ȳ
+        @test roleof(cts[2]) == Result && length(s.tape) == n0 + 2  # (x-y) + neg(ȳ)
+
+        # neg vjp: (-ȳ,)
+        cts = JOLT.vjp(JOLT.NegOp(), ȳ, [x], -x)
+        @test length(cts) == 1 && size(cts[1]) == (2, 3)
+    end
+
 end

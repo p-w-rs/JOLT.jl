@@ -71,11 +71,13 @@ Base.deepcopy(t::Tensor) = t
 # Shape & indexing
 # =====================================================================
 function Base.length(t::Tensor)
-    all(d -> d isa Int, t.shape) || error("length undefined: $t has symbolic dimension(s)")
+    isstatic(t.shape) || error("length undefined: $t has symbolic dimension(s)")
     return prod(t.shape)          # scalar (N=0) -> prod(()) == 1
 end
 Base.size(t::Tensor) = t.shape
-Base.size(t::Tensor, d::Integer) = t.shape[d]
+# Match Base.size(::AbstractArray, d): a trailing/out-of-range dim reads as 1,
+# rather than a bare BoundsError (d < 1 is still a programming error).
+Base.size(t::Tensor, d::Integer) = d <= ndims(t) ? t.shape[d] : 1
 Base.getindex(::Tensor, ::Any...) =
     error("Tensor is symbolic and holds no data; build a slice/gather op instead of indexing")
 
