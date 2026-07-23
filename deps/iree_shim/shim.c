@@ -16,11 +16,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "iree/runtime/api.h"
+// Zero-copy weights (io_parameters): the program's :variables are served by a
+// runtime parameter provider that ALIASES Julia's host arena instead of being
+// pushed as call inputs. See jolt_session_create.
+#include "iree/io/file_handle.h"
+#include "iree/io/parameter_index.h"
+#include "iree/io/parameter_index_provider.h"
+#include "iree/modules/io/parameters/module.h"
 
 typedef struct {
   iree_runtime_instance_t* instance;
   iree_hal_device_t* device;
   iree_runtime_session_t* session;
+  iree_io_parameter_index_t* param_index;    // owns the key→host-range mapping
+  iree_io_parameter_provider_t* provider;     // serves it to io_parameters.load
 } jolt_session;
 
 typedef struct {
@@ -56,9 +65,14 @@ static int hal2ecode(iree_hal_element_type_t t) {
     case IREE_HAL_ELEMENT_TYPE_FLOAT_32: return 0;
     case IREE_HAL_ELEMENT_TYPE_FLOAT_64: return 1;
     case IREE_HAL_ELEMENT_TYPE_FLOAT_16: return 2;
-    case IREE_HAL_ELEMENT_TYPE_SINT_32:  return 3;
-    case IREE_HAL_ELEMENT_TYPE_SINT_64:  return 4;
-    case IREE_HAL_ELEMENT_TYPE_SINT_8:   return 5;
+    // StableHLO integers are SIGNLESS, so outputs come back as INT_* not SINT_*;
+    // map both (same width) to the same Julia integer type.
+    case IREE_HAL_ELEMENT_TYPE_SINT_32:
+    case IREE_HAL_ELEMENT_TYPE_INT_32:   return 3;
+    case IREE_HAL_ELEMENT_TYPE_SINT_64:
+    case IREE_HAL_ELEMENT_TYPE_INT_64:   return 4;
+    case IREE_HAL_ELEMENT_TYPE_SINT_8:
+    case IREE_HAL_ELEMENT_TYPE_INT_8:    return 5;
     case IREE_HAL_ELEMENT_TYPE_BOOL_8:   return 6;
     default: return -1;
   }
@@ -66,7 +80,19 @@ static int hal2ecode(iree_hal_element_type_t t) {
 
 // Create a session over `vmfb`, using the named HAL `driver` (e.g. "local-task"
 // for CPU, "metal" for the Mac GPU).
-jolt_session* jolt_session_create(const char* vmfb_path, const char* driver) {
+//
+// If `param_nbytes > 0`, wire up zero-copy weights: build a parameter index with
+// ONE entry (`scope`::`key` → the caller's host range [param_data, param_nbytes))
+// backed by a non-owning host-allocation file handle, wrap it in a provider, and
+// append the io_parameters module BEFORE the program module so the program's
+// `io_parameters.load` resolves against it. On the local/CPU backend the load
+// imports the host pointer with no copy, so the program reads Julia's arena in
+// place. `param_data` MUST stay live (GC.@preserve) and 64-byte aligned for the
+// lifetime of the session. `param_nbytes == 0` ⇒ no parameters (e.g. a graph
+// with no variables), and the session is built exactly as before.
+jolt_session* jolt_session_create(const char* vmfb_path, const char* driver,
+                                  const char* scope, const char* key,
+                                  void* param_data, int64_t param_nbytes) {
   jolt_session* s = (jolt_session*)calloc(1, sizeof(jolt_session));
   if (!s) return NULL;
   iree_runtime_instance_options_t opts;
@@ -79,6 +105,43 @@ jolt_session* jolt_session_create(const char* vmfb_path, const char* driver) {
   iree_runtime_session_options_initialize(&sopts);
   if (!iree_status_is_ok(iree_runtime_session_create_with_device(
         s->instance, &sopts, s->device, iree_runtime_instance_host_allocator(s->instance), &s->session))) goto err;
+
+  if (param_nbytes > 0) {
+    iree_allocator_t host = iree_runtime_instance_host_allocator(s->instance);
+    iree_vm_instance_t* vm = iree_runtime_instance_vm_instance(s->instance);
+    // Non-owning wrap of Julia's arena (READ: IREE only reads weights; Julia
+    // writes them in place between calls). The null release callback means we
+    // keep ownership — the memory must outlive the session.
+    iree_io_file_handle_t* handle = NULL;
+    if (!iree_status_is_ok(iree_io_file_handle_wrap_host_allocation(
+            IREE_IO_FILE_ACCESS_READ,
+            iree_make_byte_span(param_data, (iree_host_size_t)param_nbytes),
+            iree_io_file_handle_release_callback_null(), host, &handle))) { logst("wrap_host", iree_ok_status()); goto err; }
+    iree_status_t st = iree_io_parameter_index_create(host, &s->param_index);
+    if (iree_status_is_ok(st)) {
+      iree_io_parameter_index_entry_t entry;
+      memset(&entry, 0, sizeof(entry));
+      entry.key    = iree_make_cstring_view(key);
+      entry.length = (uint64_t)param_nbytes;
+      entry.type   = IREE_IO_PARAMETER_INDEX_ENTRY_STORAGE_TYPE_FILE;
+      entry.storage.file.handle = handle;
+      entry.storage.file.offset = 0;
+      st = iree_io_parameter_index_add(s->param_index, &entry);
+    }
+    iree_io_file_handle_release(handle);   // the index retained it
+    if (!iree_status_is_ok(st)) { logst("param_index", st); goto err; }
+    if (!iree_status_is_ok(iree_io_parameter_index_provider_create(
+            iree_make_cstring_view(scope), s->param_index,
+            IREE_IO_PARAMETER_INDEX_PROVIDER_DEFAULT_MAX_CONCURRENT_OPERATIONS,
+            host, &s->provider))) { logst("provider", iree_ok_status()); goto err; }
+    iree_vm_module_t* pmod = NULL;
+    if (!iree_status_is_ok(iree_io_parameters_module_create(vm, 1, &s->provider, host, &pmod))) {
+      logst("params_module", iree_ok_status()); goto err; }
+    iree_status_t sa = iree_runtime_session_append_module(s->session, pmod);
+    iree_vm_module_release(pmod);          // the context retained it
+    if (!iree_status_is_ok(sa)) { logst("append_params", sa); goto err; }
+  }
+
   { iree_status_t st = iree_runtime_session_append_bytecode_module_from_file(s->session, vmfb_path);
     if (!iree_status_is_ok(st)) { logst("load", st); goto err; } }
   return s;
@@ -89,9 +152,11 @@ err:
 
 void jolt_session_release(jolt_session* s) {
   if (!s) return;
-  if (s->session)  iree_runtime_session_release(s->session);
-  if (s->device)   iree_hal_device_release(s->device);
-  if (s->instance) iree_runtime_instance_release(s->instance);
+  if (s->session)     iree_runtime_session_release(s->session);   // drops the module's provider ref
+  if (s->provider)    iree_io_parameter_provider_release(s->provider);
+  if (s->param_index) iree_io_parameter_index_release(s->param_index);
+  if (s->device)      iree_hal_device_release(s->device);
+  if (s->instance)    iree_runtime_instance_release(s->instance);
   free(s);
 }
 

@@ -15,11 +15,16 @@ include(joinpath(@__DIR__, "..", "..", "deps", "iree_build.jl"))   # module IREE
 const _UUID = Base.UUID("987ac434-48f5-405e-b42f-6adc1ee8369d")
 
 struct IREEBackend
-    target::String     # iree-compile  --iree-hal-target-backends=…
-    driver::String     # runtime HAL driver
+    target::String          # iree-compile  --iree-hal-target-backends=…
+    driver::String          # runtime HAL driver
+    cflags::Vector{String}  # extra iree-compile flags for this target
 end
+IREEBackend(target, driver) = IREEBackend(target, driver, String[])
 const IREE_CPU   = IREEBackend("llvm-cpu",    "local-task")
-const IREE_METAL = IREEBackend("metal-spirv", "metal")
+# Metal: embed MSL source and let the runtime compile it via Metal.framework at
+# load — so we DON'T need Xcode's `metal`/`metallib` CLI (Command Line Tools lack
+# them). `newLibraryWithSource` runs on the device at session-create instead.
+const IREE_METAL = IREEBackend("metal-spirv", "metal", ["--iree-metal-compile-to-metallib=false"])
 
 # ---- element-type codes, shared with shim.c --------------------------------
 _ecode(::Type{Float32}) = 0; _ecode(::Type{Float64}) = 1; _ecode(::Type{Float16}) = 2
@@ -48,6 +53,15 @@ mutable struct IREEExecutable
     vmfb::String
     driver::String
     session::Ptr{Cvoid}
+    # Zero-copy weights (io_parameters): the session's provider ALIASES this arena
+    # (the `vars` ComponentArray's backing). `param_hold` keeps it GC-alive for the
+    # session's lifetime — the import is non-owning. `param_nbytes == 0` ⇒ no
+    # provider (a graph with no variables, or a non-IREE path).
+    param_ptr::Ptr{Cvoid}
+    param_nbytes::Int
+    param_hold::Any
+    scope::String
+    key::String
 end
 
 "Compile StableHLO `text` to a .vmfb for `backend`."
@@ -55,8 +69,26 @@ function iree_build(backend::IREEBackend, text::AbstractString)
     _ensure_runtime()
     dir = mktempdir(); inp = joinpath(dir, "in.mlir"); vmfb = joinpath(dir, "out.vmfb")
     write(inp, text)
-    run(`$(_iree_compile()) --iree-input-type=stablehlo --iree-hal-target-backends=$(backend.target) $inp -o $vmfb`)
-    return IREEExecutable(vmfb, backend.driver, C_NULL)
+    # Respect the user's declared dtype: iree-compile demotes f64→f32 and i64→i32
+    # by DEFAULT, which would silently lose precision (and breaks our parameter
+    # global, whose value attr keeps the original type). Keep the declared type;
+    # a backend that can't support it (e.g. f64 on Metal) then errors honestly.
+    run(`$(_iree_compile()) --iree-input-type=stablehlo
+         --iree-input-demote-f64-to-f32=false --iree-input-demote-i64-to-i32=false
+         --iree-hal-target-backends=$(backend.target) $(backend.cflags) $inp -o $vmfb`)
+    return IREEExecutable(vmfb, backend.driver, C_NULL, C_NULL, 0, nothing, "", "")
+end
+
+# Bind `vars`' contiguous arena as the session's zero-copy weights parameter.
+# Called by `compile` once the ComponentArray exists; the executable then keeps
+# the arena alive and hands its pointer to the provider at session-create.
+function bind_params!(e::IREEExecutable, data::AbstractVector, scope::AbstractString, key::AbstractString)
+    e.param_hold   = data
+    e.param_ptr    = pointer(data)
+    e.param_nbytes = sizeof(data)
+    e.scope        = String(scope)
+    e.key          = String(key)
+    return e
 end
 
 # Contiguous column-major bytes of `a`. With the reverse-dims graph these bytes
@@ -69,7 +101,9 @@ _flat(a::AbstractArray) = vec(Array(a))
 function iree_run(e::IREEExecutable, inputs::Vector)
     _ensure_runtime()
     if e.session == C_NULL
-        e.session = ccall(_sym[:jolt_session_create], Ptr{Cvoid}, (Cstring, Cstring), e.vmfb, e.driver)
+        e.session = GC.@preserve e ccall(_sym[:jolt_session_create], Ptr{Cvoid},
+            (Cstring, Cstring, Cstring, Cstring, Ptr{Cvoid}, Int64),
+            e.vmfb, e.driver, e.scope, e.key, e.param_ptr, Int64(e.param_nbytes))
         e.session == C_NULL && error("IREE: session create failed for $(e.vmfb) on driver `$(e.driver)`")
     end
     call = ccall(_sym[:jolt_call_begin], Ptr{Cvoid}, (Ptr{Cvoid}, Cstring), e.session, "module.main")

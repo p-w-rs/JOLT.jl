@@ -18,6 +18,7 @@ using Random   # rng-driven initializers (randn/rand) in initializers.jl
 using ComponentArrays        # the `vars` container returned by compile
 using StableRNGs             # version-stable per-variable init streams
 import Libdl, SHA            # Libdl: dlopen/ccall the IREE shim;  SHA: stable seeds
+import Mmap                  # page-aligned arena backing `vars` for zero-copy IREE import
 
 # Include order matters for TYPES (each file's structs must exist before a
 # later file mentions them in a field or signature): dims.jl defines Dim/Facts,

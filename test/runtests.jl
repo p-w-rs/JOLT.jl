@@ -1,5 +1,6 @@
 using Test
 using JOLT
+import Optimisers   # test-only: verify a real optimizer step keeps `vars` zero-copy (numeric.jl)
 
 # Tests are split by source module (tensor.jl, session.jl); shared introspection
 # helpers live in util.jl. Every testset starts with a fresh session
@@ -17,4 +18,5 @@ include("util.jl")
     include("matmul.jl")      # *
     include("gradients.jl")   # ∇, second order, stop_gradient, grad_reversal, broadcasting grads
     include("compile.jl")     # end-to-end IREE compile+run (skips if IREE isn't built)
+    include("numeric.jl")     # end-to-end NUMERICAL check: every op + 1st/2nd-order grads vs references
 end
