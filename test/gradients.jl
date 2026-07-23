@@ -148,4 +148,23 @@
         @test_throws ErrorException ∇(stale; wrt=Tensor(Var, Float32))
     end
 
+    # The payoff of the reduce/broadcast layer: real scalar losses via sum, and
+    # gradients that flow back through broadcasting (the bias reduces correctly).
+    @testset "gradients through broadcasting & sum" begin
+        new_session!()
+        W = Tensor(Var, 3, 4)
+        b = Tensor(Var, 4)                                    # bias, broadcast over rows
+        d = W .+ b
+        loss = sum(d .* d)                                    # scalar loss, no rank-0 var needed
+        g = ∇(loss; wrt=[W, b])
+        @test size(g[1]) == (3, 4)                            # ∂/∂W keeps W's shape
+        @test size(g[2]) == (4,)                              # ∂/∂b reduced over the broadcast axis
+        @test roleof(∇(sum(W); wrt=W)) == Result
+
+        # second order flows through broadcasting + reduce too
+        p = Tensor(Var, 3); q = Tensor(Var, 1)
+        gp = ∇(sum(p .+ q); wrt=p)
+        @test size(∇(sum(gp .* p); wrt=q)) == (1,)
+    end
+
 end

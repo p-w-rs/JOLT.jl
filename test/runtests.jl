@@ -12,7 +12,8 @@ include("util.jl")
     include("tensor.jl")
     include("session.jl")
     include("ops.jl")         # Op machinery + basic elementwise (add/sub/mul/neg)
-    include("reshaping.jl")   # reshape, transpose
+    include("reduce.jl")      # reduce_sum, sum
+    include("reshaping.jl")   # reshape, transpose, broadcasting (.+ .- .*)
     include("matmul.jl")      # *
-    include("gradients.jl")   # ∇, second order, stop_gradient, grad_reversal
+    include("gradients.jl")   # ∇, second order, stop_gradient, grad_reversal, broadcasting grads
 end

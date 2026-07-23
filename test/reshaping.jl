@@ -53,4 +53,36 @@
         @test size(cts[1]) == (2, 3, 4)                    # back to x's shape
     end
 
+    @testset "broadcasting (.+ .- .*)" begin
+        new_session!()
+        z = Tensor(3, 1) .+ Tensor(1, 4)
+        @test z isa Tensor && size(z) == (3, 4)            # intercepted (not a Broadcasted), stretched
+        @test size(Tensor(2, 3) .- Tensor(3)) == (2, 3)    # left-pad align
+        @test size(Tensor(2, 3) .* Tensor(2, 3)) == (2, 3) # same shape
+        @test size(2f0 .* Tensor(2, 3)) == (2, 3)          # scalar · tensor
+        @test size(Tensor(2, 3) .+ 1f0) == (2, 3)
+        @test size(Tensor(:B, 1) .+ Tensor(:B, 4)) == (todim(:B), 4)  # dynamic dim CARRIED through
+        @test_throws ErrorException Tensor(3, 2) .+ Tensor(4)         # 2 vs 4 not broadcastable
+        # dynamic NEW axis (bias over a :B batch) needs dynamic_broadcast_in_dim — rejected for now
+        @test_throws ErrorException Tensor(:B, 4) .+ Tensor(4)
+        # unsupported op / operand type throws (rather than silently doing the wrong
+        # thing); curated messages for these are deferred (need a Tensor BroadcastStyle)
+        @test_throws Exception Tensor(2, 3) ./ Tensor(2, 3)
+        @test_throws Exception Tensor(2, 3) .+ [1f0, 2f0, 3f0]
+    end
+
+    @testset "broadcast_to: forward + vjp reduces the stretched axes" begin
+        new_session!()
+        a = Tensor(3, 1)
+        bt = broadcast_to(a, (3, 4), [1, 2])               # stretch axis 2: 1 -> 4
+        @test size(bt) == (3, 4)
+        @test mlir_ranked(bt) == (Float32, (3, 4))
+        ȳ = Tensor(3, 4)
+        cts = JOLT.vjp(JOLT.BroadcastToOp((3, 4), [1, 2]), ȳ, [a], bt)
+        @test size(cts[1]) == (3, 1)                       # summed over the stretched axis, reshaped back
+        # replicate into a NEW leading axis (as reduce_sum's vjp does)
+        r = broadcast_to(Tensor(4), (2, 4), [2])
+        @test size(r) == (2, 4)
+    end
+
 end

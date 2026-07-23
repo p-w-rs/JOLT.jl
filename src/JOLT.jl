@@ -46,9 +46,10 @@ export default_dtype, default_dtype!
 export namespace, pushnamespace!, popnamespace!, clearnamespace!
 
 include("ops/basic.jl")       # add, subtract, multiply (mul), negate
-include("ops/reshaping.jl")   # reshape, transpose (permutedims), adjoint
-include("ops/matmul.jl")      # * — 2-D matmul
+include("ops/reduce.jl")      # reduce_sum, sum
+include("ops/reshaping.jl")   # reshape, transpose (permutedims), broadcast_to, .+/.-/.*
+include("ops/matmul.jl")      # * — batched matmul
 include("ops/gradients.jl")   # ∇/gradient, stop_gradient, grad_reversal
-export mul, ∇, gradient, stop_gradient, grad_reversal
+export mul, ∇, gradient, stop_gradient, grad_reversal, reduce_sum, broadcast_to
 
 end # module JOLT
