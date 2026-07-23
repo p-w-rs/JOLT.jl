@@ -108,16 +108,31 @@
             end
         end
 
-        # ---- symbolic (dynamic) dims: FORWARD, both backends. (Gradients that
-        # reduce over a dynamic axis need dynamic_broadcast_in_dim — not yet
-        # implemented — so only forward is covered.) ----
+        # ---- symbolic (dynamic) dims through IREE, both backends — forward AND
+        # gradients (incl. broadcasting a cotangent back into a dynamic axis via
+        # dynamic_broadcast_in_dim), plus grads-on-grads through a dynamic graph. ----
         symcases = [
-            "sum over :B"   => () -> (x = Tensor(:B,4;name="x"); (JOLT.Tensor[x], JOLT.Tensor[sum(x)], (Float32[1 2 3 4; 5 6 7 8; 9 10 11 12],), [Float32(sum(1:12))])),
-            "matmul :B×3"   => () -> (X = Tensor(:B,3;name="X"); W = Tensor(Var,3,4;init=Ones()); (JOLT.Tensor[X], JOLT.Tensor[X*W], (A2,), [A2 * ones(Float32,3,4)])),
+            # forward
+            "sum over :B"    => () -> (x = Tensor(:B,4;name="x"); (JOLT.Tensor[x], JOLT.Tensor[sum(x)], (Float32[1 2 3 4; 5 6 7 8; 9 10 11 12],), [Float32(sum(1:12))])),
+            "matmul :B×3"    => () -> (X = Tensor(:B,3;name="X"); W = Tensor(Var,3,4;init=Ones()); (JOLT.Tensor[X], JOLT.Tensor[X*W], (A2,), [A2 * ones(Float32,3,4)])),
             "reduce over :B" => () -> (x = Tensor(:B,4;name="x"); (JOLT.Tensor[x], JOLT.Tensor[reduce_sum(x,(1,))], (Float32[1 2 3 4; 5 6 7 8],), [vec(sum(Float32[1 2 3 4; 5 6 7 8]; dims=1))])),
             "two dyn args +" => () -> (x = Tensor(:B,4;name="x"); y = Tensor(:B,4;name="y"); (JOLT.Tensor[x,y], JOLT.Tensor[x+y], (Float32[1 2 3 4; 5 6 7 8], Float32[1 1 1 1; 2 2 2 2]), [Float32[2 3 4 5; 7 8 9 10]])),
+            # gradients: cotangent broadcasts back over the dynamic axis
+            "grad matmul :B (gW)" => () -> (X = Tensor(:B,3;name="X"); W = Tensor(Var,3,4;init=Ones()); L = sum(X*W); (JOLT.Tensor[X], JOLT.Tensor[∇(L;wrt=W)], (A2,), [permutedims(A2) * ones(Float32,2,4)])),
+            "grad bias over :B (gb)" => () -> (x = Tensor(:B,4;name="x"); b = Tensor(Var,4;init=Ones()); L = sum(x .+ b); (JOLT.Tensor[x], JOLT.Tensor[∇(L;wrt=b)], (Float32[1 2 3 4; 5 6 7 8; 9 10 11 12],), [fill(3f0,4)])),
+            # grads-on-grads THROUGH a dynamic graph: L=Σ(Xᵢⱼwⱼ)² ⇒ g1ⱼ=2wⱼΣᵢXᵢⱼ², g2ⱼ=2ΣᵢXᵢⱼ²
+            "2nd-order through :B" => function ()
+                Xv = Float32[1 2 3 4; 5 6 7 8]; cs = vec(sum(Xv.^2; dims=1))
+                X = Tensor(:B,4;name="X"); w = Tensor(Var,4;init=Ones())
+                y = X .* w; L = sum(mul(y,y)); g1 = ∇(L;wrt=w)
+                (JOLT.Tensor[X], JOLT.Tensor[L, g1, ∇(sum(g1);wrt=w)], (Xv,), [sum(cs), 2 .* cs, 2 .* cs])
+            end,
+            # seeded VJP of a NON-scalar, dynamically-shaped loss via ones_like (no manual dynamic seed):
+            # y=X.*w (shape (:B,4)); ones_like(y)ᵀ·Jᵥ = Σᵢ Xᵢₖ = colsum(X).
+            "seeded VJP over :B (ones_like)" => () -> (X = Tensor(:B,4;name="X"); w = Tensor(Var,4;init=Ones());
+                y = X .* w; (JOLT.Tensor[X], JOLT.Tensor[∇(y; wrt=w, seed=ones_like(y))], (Float32[1 2 3 4; 5 6 7 8],), [vec(sum(Float32[1 2 3 4; 5 6 7 8]; dims=1))])),
         ]
-        @testset "symbolic dims (forward)" begin
+        @testset "symbolic dims" begin
             for (bname, bk) in backends
                 @testset "$bname" begin
                     for (cn, th) in symcases

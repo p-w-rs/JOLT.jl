@@ -61,7 +61,14 @@ Base.reshape(a::Tensor, dims::Union{Integer,Symbol,Poly}...) =
 struct BroadcastToOp <: Op
     shape::Tuple           # target shape
     bdims::Vector{Int}     # 1-based: input dim i -> target dim bdims[i]
+    # DYNAMIC broadcast plan (empty ⇒ fully static, lower via broadcast_in_dim):
+    # one entry per target axis (Julia order) giving its runtime size — a static
+    # Int, or (src::Tensor, src_julia_axis) to read at run time via
+    # get_dimension_size. Set by `broadcast_to` when a dynamic target axis isn't
+    # supplied by the operand itself. See `broadcast_to`.
+    dynsize::Vector{Any}
 end
+BroadcastToOp(shape, bdims) = BroadcastToOp(shape, bdims, Any[])
 function outshape(op::BroadcastToOp, sa)
     n = length(op.shape)
     length(op.bdims) == length(sa) ||
@@ -75,25 +82,43 @@ function outshape(op::BroadcastToOp, sa)
         (dims_equal(d, 1) || dims_equal(d, t)) ||
             error("broadcast_to: input dim $i ($d) cannot stretch to target dim $(op.bdims[i]) ($t)")
     end
-    # A dynamic target axis needs a mapped, non-1 input dim to supply its runtime
-    # size. Broadcasting INTO a dynamic new/stretched axis (e.g. a bias over a :B
-    # batch) needs stablehlo.dynamic_broadcast_in_dim — not implemented yet, so we
-    # reject at build time rather than emit unresolvable IR.
-    for j in 1:n
-        op.shape[j] isa Int && continue
-        i = findfirst(==(j), op.bdims)
-        (i !== nothing && !dims_equal(sa[i], 1)) ||
-            error("broadcast_to: target axis $j is dynamic ($(op.shape[j])) with no input dim to supply " *
-                  "its runtime size. Broadcasting into a dynamic new/stretched axis (e.g. a bias over a " *
-                  ":B batch) needs dynamic_broadcast_in_dim (not implemented yet) — use a concrete size for now.")
-    end
+    # A dynamic target axis not carried by the operand is fine now — `broadcast_to`
+    # has already resolved a runtime-size source for it (or errored). No rejection.
     return op.shape
 end
-lower(op::BroadcastToOp, x) = shlo.broadcast_in_dim(x.value;
-    result_0 = mlir_type(eltype(x), op.shape),        # input dim i → output dim bdims[i], in reversed space
-    broadcast_dimensions = i64array([length(op.shape) - b for b in reverse(op.bdims)]))
+
+# Static case: broadcast_in_dim (extents baked into the result type). Dynamic case:
+# dynamic_broadcast_in_dim, with output_dimensions built as a 1-D i32 shape vector
+# (in REVERSED/MLIR axis order) from get_dimension_size of the recorded sources +
+# static-dim constants. (Verified against iree-compile 3.12; see [[jolt-verified-constraints]].)
+function lower(op::BroadcastToOp, x)
+    bdim_attr = i64array([length(op.shape) - b for b in reverse(op.bdims)])
+    isempty(op.dynsize) && return shlo.broadcast_in_dim(x.value;
+        result_0 = mlir_type(eltype(x), op.shape), broadcast_dimensions = bdim_attr)
+    n = length(op.shape); blk = session().block; one_i32 = mlir_type(Int32, (1,))
+    parts = IR.Value[]
+    for k in 0:(n - 1)                          # MLIR result axis k ⇐ Julia target axis n-k
+        spec = op.dynsize[n - k]
+        if spec isa Int
+            c = shlo.constant(; value = IR.DenseElementsAttribute(Int32[spec]), output = one_i32)
+            push!(blk, c); push!(parts, IR.result(c, 1))
+        else
+            src, a = spec                       # Julia axis a of src ⇒ MLIR axis ndims(src)-a
+            gd = shlo.get_dimension_size(src.value; dimension = ir_attr("$(ndims(src) - a) : i64"))
+            push!(blk, gd)
+            rs = shlo.reshape(IR.result(gd, 1); result_0 = one_i32)   # scalar i32 → tensor<1xi32>
+            push!(blk, rs); push!(parts, IR.result(rs, 1))
+        end
+    end
+    dims = shlo.concatenate(parts; result_0 = mlir_type(Int32, (n,)), dimension = ir_attr("0 : i64"))
+    push!(blk, dims)
+    return shlo.dynamic_broadcast_in_dim(x.value, IR.result(dims, 1);
+        result_0 = mlir_type(eltype(x), op.shape), broadcast_dimensions = bdim_attr)
+end
 # backward: sum ȳ over the axes that were replicated (new) or stretched (input
-# was size-1), then reshape back so the input's size-1 dims are restored.
+# was size-1), then reshape back so the input's size-1 dims are restored. (Works
+# unchanged for the dynamic case — reduce_sum handles dynamic dims, and its own
+# vjp broadcasts back with a source, closing the loop for higher order.)
 function vjp(op::BroadcastToOp, ȳ, ins, out)
     insh = size(ins[1])
     new_ax     = [j for j in 1:length(op.shape) if !(j in op.bdims)]
@@ -104,9 +129,37 @@ function vjp(op::BroadcastToOp, ȳ, ins, out)
     return (size(g) == insh ? g : apply(ReshapeOp(insh), g),)
 end
 
-broadcast_to(x::Tensor, shape, bdims) =
-    (Tuple(shape) == size(x) && collect(Int, bdims) == collect(1:ndims(x))) ? x :
-    apply(BroadcastToOp(Tuple(shape), collect(Int, bdims)), x)
+# `srcs` are tensors whose axes can supply the RUNTIME SIZE of a dynamic target
+# axis that the operand `x` doesn't itself carry (e.g. a bias/seed broadcast over
+# a :B batch — the size lives in a sibling tensor). Matched by Dim identity.
+function broadcast_to(x::Tensor, shape, bdims; srcs::AbstractVector = Tensor[])
+    shape = Tuple(shape); bdims = collect(Int, bdims)
+    (shape == size(x) && bdims == collect(1:ndims(x))) && return x       # no-op broadcast
+    sa = size(x); n = length(shape)
+    # Which dynamic target axes does `x` NOT supply itself? Those need a run-time
+    # source (from `x` if it carries the dim, else from `srcs`).
+    covered(j) = (i = findfirst(==(j), bdims); i !== nothing && !dims_equal(sa[i], 1))
+    needs_dyn = any(j -> !(shape[j] isa Int) && !covered(j), 1:n)
+    needs_dyn || return apply(BroadcastToOp(shape, bdims, Any[]), x)      # static path
+    dynsize = Vector{Any}(undef, n)                                       # resolve every axis' size
+    for j in 1:n
+        if shape[j] isa Int
+            dynsize[j] = Int(shape[j])
+        elseif (i = findfirst(==(j), bdims); i !== nothing && !dims_equal(sa[i], 1))
+            dynsize[j] = (x, i)                                           # x carries this dim
+        else
+            hit = nothing
+            for s in srcs, a in 1:ndims(s)
+                dims_equal(size(s)[a], shape[j]) && (hit = (s, a); break)
+            end
+            hit === nothing &&
+                error("broadcast_to: no source supplies the runtime size of dynamic target axis $j " *
+                      "($(shape[j])); pass a `srcs=` tensor that carries it.")
+            dynsize[j] = hit
+        end
+    end
+    return apply(BroadcastToOp(shape, bdims, dynsize), x)
+end
 
 # left-pad (NumPy) alignment: a rank-`ra` input maps to the TRAILING `ra` axes.
 _trailing_bdims(ra, n) = collect((n - ra + 1):n)
@@ -114,8 +167,9 @@ _trailing_bdims(ra, n) = collect((n - ra + 1):n)
 function _bcast(f, a::Tensor, b::Tensor)
     s = broadcast_shapes(size(a), size(b))
     n = length(s)
-    return f(broadcast_to(a, s, _trailing_bdims(ndims(a), n)),
-             broadcast_to(b, s, _trailing_bdims(ndims(b), n)))
+    # Either operand may supply a dynamic axis the other lacks (e.g. bias over :B).
+    return f(broadcast_to(a, s, _trailing_bdims(ndims(a), n); srcs = Tensor[a, b]),
+             broadcast_to(b, s, _trailing_bdims(ndims(b), n); srcs = Tensor[a, b]))
 end
 
 # More specific than Base's generic `broadcasted`, so these intercept .+/.-/.*

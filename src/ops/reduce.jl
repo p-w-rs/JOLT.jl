@@ -45,8 +45,11 @@ function lower(op::ReduceSumOp, x)
 end
 # backward: replicate ȳ across the reduced axes — broadcast it into the input
 # shape, mapping ȳ's dims to the kept axes (the reduced axes become new/replicated).
+# `ins[1]` (the reduced input) is passed as the shape-source: if a reduced axis is
+# dynamic (e.g. summing over a :B batch), its runtime size is read from ins[1] via
+# dynamic_broadcast_in_dim — which is what makes gradients of dynamic-dim graphs work.
 vjp(op::ReduceSumOp, ȳ, ins, out) =
-    (broadcast_to(ȳ, size(ins[1]), [i for i in 1:ndims(ins[1]) if !(i in op.dims)]),)
+    (broadcast_to(ȳ, size(ins[1]), [i for i in 1:ndims(ins[1]) if !(i in op.dims)]; srcs = Tensor[ins[1]]),)
 
 function reduce_sum(x::Tensor, dims)
     ax = sort!(unique(Int[d for d in dims]))

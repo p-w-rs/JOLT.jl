@@ -63,8 +63,9 @@
         @test size(Tensor(2, 3) .+ 1f0) == (2, 3)
         @test size(Tensor(:B, 1) .+ Tensor(:B, 4)) == (todim(:B), 4)  # dynamic dim CARRIED through
         @test_throws ErrorException Tensor(3, 2) .+ Tensor(4)         # 2 vs 4 not broadcastable
-        # dynamic NEW axis (bias over a :B batch) needs dynamic_broadcast_in_dim — rejected for now
-        @test_throws ErrorException Tensor(:B, 4) .+ Tensor(4)
+        # dynamic NEW axis (a bias over a :B batch) now builds — it lowers via
+        # dynamic_broadcast_in_dim (runtime size read from the sibling with :B).
+        @test size(Tensor(:B, 4) .+ Tensor(4)) == (todim(:B), 4)
         # unsupported op / operand type throws (rather than silently doing the wrong
         # thing); curated messages for these are deferred (need a Tensor BroadcastStyle)
         @test_throws Exception Tensor(2, 3) ./ Tensor(2, 3)

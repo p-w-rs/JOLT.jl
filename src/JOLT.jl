@@ -55,6 +55,7 @@ include("ops/reshaping.jl")   # reshape, transpose (permutedims), broadcast_to, 
 include("ops/matmul.jl")      # * — batched matmul
 include("ops/gradients.jl")   # ∇/gradient, stop_gradient, grad_reversal
 export mul, ∇, gradient, stop_gradient, grad_reversal, reduce_sum, broadcast_to
+export ones_like, zeros_like, fill_like
 
 include("compile/module.jl")  # graph → func.func → StableHLO module + text
 include("compile/iree.jl")    # IREE backend: iree-compile subprocess + runtime ccall shim

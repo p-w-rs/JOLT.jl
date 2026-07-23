@@ -13,6 +13,13 @@
 zeros_like(x::Tensor{T}) where {T} =
     isstatic(size(x)) ? Tensor(Const, zeros(T, size(x)...)) : x - x
 
+# A constant-valued tensor shaped like `x` — DYNAMIC shapes included: it
+# broadcasts a scalar into `x`'s (possibly `?`) shape via dynamic_broadcast_in_dim,
+# reading the runtime sizes from `x` itself. This is how you seed a NON-scalar
+# loss (whose shape may be dynamic): `∇(y; wrt=w, seed=ones_like(y))`.
+fill_like(x::Tensor, v) = broadcast_to(Tensor(Const, fill(convert(eltype(x), v))), size(x), Int[]; srcs = Tensor[x])
+ones_like(x::Tensor)    = fill_like(x, one(eltype(x)))
+
 # --- gradient-routing ops (identity forward, custom backward) -------
 # Forward is a pass-through (optimization_barrier keeps it from being folded
 # away); only the vjp differs.
@@ -57,7 +64,8 @@ function _backprop(s::Session, loss::Tensor, seed::Tensor)
 end
 
 _ones_seed(loss::Tensor) = isempty(size(loss)) ? Tensor(Const, one(eltype(loss))) :
-    error("∇ needs a scalar loss (shape $(size(loss))); reduce it first, or pass a seed=… cotangent.")
+    error("∇ needs a scalar loss (shape $(size(loss))); reduce it to a scalar (e.g. `sum`), " *
+          "or pass an explicit cotangent — e.g. `seed = ones_like(loss)` (works for dynamic shapes too).")
 
 # --- selection: which tensors to collect ----------------------------
 _hasprefix(path::Tuple, pre::Tuple) = length(path) >= length(pre) && path[1:length(pre)] == pre
