@@ -10,6 +10,7 @@
 mutable struct Session
     context::IR.Context
     block::IR.Block
+    dtype::DataType                             # default element type when a constructor is given none
     argvars::Vector{Tensor}                     # Arg/Var tensors, in block-argument order
     scope::Vector{Symbol}                       # current namespace stack (mutable)
     names::Dict{Tuple{Vararg{Symbol}},Tensor}   # scoped path -> tensor
@@ -25,6 +26,7 @@ function Session()
     block = IR.Block()
     return Session(
         ctx, block,
+        Float32,                                # dtype seed (default element type)
         Tensor[],
         Symbol[],
         Dict{Tuple{Vararg{Symbol}},Tensor}(),
@@ -42,26 +44,20 @@ function Base.show(io::IO, s::Session)
 end
 
 # =====================================================================
-# Default element type.
-#
-# The dtype a constructor falls back to when it isn't handed one (seeded
-# from DEFAULT_ELTYPE in tensor.jl). Settable at runtime.
-#
-#   default_dtype()    -> the element type used when a constructor is given none
-#   default_dtype!(T)  -> change it; persists until set again
-# =====================================================================
-const _DTYPE   = Base.RefValue{DataType}(DEFAULT_ELTYPE)
-default_dtype() = _DTYPE[]
-default_dtype!(::Type{T}) where {T<:Real} = (_DTYPE[] = T; T)
-
-# =====================================================================
 # Global session (transparent: you never have to create one).
 #
+# Lifecycle — install, retrieve, or replace the one active session:
 #   session()          -> the active session (building + activating one on first use)
 #   session!(s)        -> install `s` as the active session (activating its context)
 #   new_session!()     -> fresh session, installed and returned
 #   reset_session!()   -> drop the current session and pop its context
 #   with_session(f, s) -> run `f` with `s` active, then restore the previous one
+#
+# Active-session accessors — reach through the current session so callers never
+# touch it directly:
+#   current_facts()    -> its symbolic-dim constraint store (dims.jl)
+#   default_dtype()    -> the element type a constructor falls back to when given none
+#   default_dtype!(T)  -> set that default for the active session
 # =====================================================================
 const _SESSION = Base.RefValue{Union{Nothing,Session}}(nothing)
 
@@ -81,10 +77,6 @@ function session()
     _SESSION[] === nothing && session!(Session())
     return _SESSION[]::Session
 end
-
-# The active session's constraint store — the single point through which
-# dims.jl's convenience queries (dims_equal, same_dim!, …) reach the session.
-current_facts() = session().facts
 
 new_session!() = session!(Session())
 
@@ -115,6 +107,19 @@ function with_session(f, s::Session)
         old === nothing || IR.activate(old.context)
     end
 end
+
+# Active-session accessors — each reaches through session() into whatever
+# session is current, so the dims/ops/tensor layers stay session-agnostic.
+
+# Its symbolic-dim constraint store: the single point through which dims.jl's
+# convenience queries (dims_equal, same_dim!, …) reach the session.
+current_facts() = session().facts
+
+# Its default element type — what a Tensor constructor uses when given no dtype.
+# A Session field (seeded to Float32 in Session()), so a fresh session starts
+# from the default; default_dtype!(T) changes it for the active session only.
+default_dtype()            = session().dtype
+default_dtype!(::Type{T}) where {T<:Real} = (session().dtype = T; T)
 
 # =====================================================================
 # Naming, scopes & the name registry
@@ -190,7 +195,7 @@ end
 mlir_type(::Type{T}, shape) where {T} =
     IR.TensorType(Int[dim_to_mlir(d) for d in reverse(shape)], IR.Type(T))
 
-function push_arg!(::Type{T}, shape::NTuple{N,Dim}; name=nothing) where {T,N}
+function push_arg!(shape::NTuple{N,Dim}, ::Type{T}=default_dtype(); name=nothing) where {N,T}
     for d in shape                              # a negative Int would mint invalid MLIR
         d isa Int && d < 0 &&
             error("invalid dimension $d: concrete dims must be ≥ 0 (use a Symbol for a runtime dim)")
@@ -207,7 +212,7 @@ end
 # A Variable is stored as shape + initializer; its array is realized at compile
 # time (the ops/compile layer calls `init(rng, T, dims...)`), so nothing is
 # allocated here. `init` must be a function with the (rng, T, dims...) signature.
-function push_var!(init, ::Type{T}, dims::NTuple{N,Int}; name=nothing) where {T,N}
+function push_var!(init, dims::NTuple{N,Int}, ::Type{T}=default_dtype(); name=nothing) where {N,T}
     init isa Function ||
         error("a Variable's init must be a function; got $(typeof(init))")
     # Verify the signature WITHOUT calling it (no probe allocation): does a method

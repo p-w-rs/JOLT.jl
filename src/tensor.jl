@@ -21,11 +21,10 @@ const Const = Constant
 const Res   = Result
 
 # =====================================================================
-# Hard fallback defaults. The *session* default dtype (settable at runtime)
-# lives in session.jl; this constant is only the seed value for it.
+# Hard fallback default role. (The default *dtype* is a Session field, seeded
+# to Float32 in Session(); change it at runtime with default_dtype!.)
 # =====================================================================
-const DEFAULT_ELTYPE = Float32
-const DEFAULT_ROLE   = Argument
+const DEFAULT_ROLE = Argument
 
 # =====================================================================
 # Tensor
@@ -174,17 +173,17 @@ Tensor(R::TensorRole, args...; kw...) = Tensor(Val(R), args...; kw...)
 Tensor(::Type{T}, R::TensorRole, args...; kw...) where {T<:Real} = Tensor(Val(R), T, args...; kw...)
 
 # --- Arguments (placeholders) — the only role that may be symbolic ---
-Tensor(; name=nothing) = push_arg!(default_dtype(), (); name=name)   # scalar arg (breaks the empty-varargs tie)
-Tensor(dims::Union{Integer,Symbol,Poly}...; name=nothing) = push_arg!(default_dtype(), map(todim, dims); name=name)
-Tensor(::Type{T}, dims::Union{Integer,Symbol,Poly}...; name=nothing) where {T<:Real} = push_arg!(T, map(todim, dims); name=name)
-Tensor(::Val{Argument}, dims::Union{Integer,Symbol,Poly}...; name=nothing) = push_arg!(default_dtype(), map(todim, dims); name=name)
-Tensor(::Val{Argument}, ::Type{T}, dims::Union{Integer,Symbol,Poly}...; name=nothing) where {T<:Real} = push_arg!(T, map(todim, dims); name=name)
+Tensor(; name=nothing) = push_arg!((); name=name)   # scalar arg (breaks the empty-varargs tie)
+Tensor(dims::Union{Integer,Symbol,Poly}...; name=nothing) = push_arg!(map(todim, dims); name=name)
+Tensor(::Type{T}, dims::Union{Integer,Symbol,Poly}...; name=nothing) where {T<:Real} = push_arg!(map(todim, dims), T; name=name)
+Tensor(::Val{Argument}, dims::Union{Integer,Symbol,Poly}...; name=nothing) = push_arg!(map(todim, dims); name=name)
+Tensor(::Val{Argument}, ::Type{T}, dims::Union{Integer,Symbol,Poly}...; name=nothing) where {T<:Real} = push_arg!(map(todim, dims), T; name=name)
 
 # --- Variable: concrete shape + an initializer (default Zeros()) -----
 Tensor(::Val{Variable}, dims::Integer...; init=Zeros(), name=nothing) =
-    push_var!(init, default_dtype(), map(Int, dims); name=name)
+    push_var!(init, map(Int, dims); name=name)
 Tensor(::Val{Variable}, ::Type{T}, dims::Integer...; init=Zeros(), name=nothing) where {T<:Real} =
-    push_var!(init, T, map(Int, dims); name=name)
+    push_var!(init, map(Int, dims), T; name=name)
 # reject symbolic dims (only an Argument may be symbolic)
 Tensor(::Val{Variable}, dims::Union{Integer,Symbol,Poly}...; kw...) = _var_symbolic_err(dims)
 Tensor(::Val{Variable}, ::Type{T}, dims::Union{Integer,Symbol,Poly}...; kw...) where {T<:Real} = _var_symbolic_err(dims)

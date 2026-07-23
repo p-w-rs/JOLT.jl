@@ -147,17 +147,14 @@
     end
 
     @testset "default dtype" begin
-        @test default_dtype() == Float32
-        try
-            default_dtype!(Float64)
-            @test default_dtype() == Float64
-            new_session!()
-            @test eltype(Tensor(3))      == Float64     # arg picks up the default
-            @test eltype(Tensor(Var, 2)) == Float64     # so does a variable
-        finally
-            default_dtype!(Float32)                     # don't leak into later sets
-        end
-        @test default_dtype() == Float32
+        new_session!()
+        @test default_dtype() == Float32               # fresh session default
+        default_dtype!(Float64)
+        @test default_dtype() == Float64
+        @test eltype(Tensor(3))      == Float64         # arg picks up the session default
+        @test eltype(Tensor(Var, 2)) == Float64         # so does a variable
+        new_session!()
+        @test default_dtype() == Float32               # a fresh session resets it
     end
 
     @testset "name registry" begin

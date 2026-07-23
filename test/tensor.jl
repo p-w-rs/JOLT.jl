@@ -14,7 +14,6 @@
         @test JOLT.Res === JOLT.Result
         @test Argument isa TensorRole
 
-        @test JOLT.DEFAULT_ELTYPE === Float32
         @test JOLT.DEFAULT_ROLE   === Argument
     end
 
