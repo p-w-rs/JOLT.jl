@@ -49,12 +49,14 @@ export default_dtype, default_dtype!
 export namespace, pushnamespace!, popnamespace!, clearnamespace!
 export getArgument, getArg, getVariable, getVar, getConstant, getConst, getTensor
 
-include("ops/basic.jl")       # add, subtract, multiply (mul), negate
+include("ops/basic.jl")       # elementwise + - * / (mul), negate, divide
 include("ops/reduce.jl")      # reduce_sum, sum
-include("ops/reshaping.jl")   # reshape, transpose (permutedims), broadcast_to, .+/.-/.*
-include("ops/matmul.jl")      # * — batched matmul
+include("ops/reshaping.jl")   # reshape, transpose (permutedims), broadcast_to, .+/.-/.*/./ , ⊙
+include("ops/matmul.jl")      # matmul / ⊡ — batched matmul
+include("ops/einsum.jl")      # einsum (general contraction), dot / ⋅
 include("ops/gradients.jl")   # ∇/gradient, stop_gradient, grad_reversal
-export mul, ∇, gradient, stop_gradient, grad_reversal, reduce_sum, broadcast_to
+export mul, matmul, ⊡, ⊙, einsum, dot, ⋅
+export ∇, gradient, stop_gradient, grad_reversal, reduce_sum, broadcast_to
 export ones_like, zeros_like, fill_like
 
 include("compile/module.jl")  # graph → func.func → StableHLO module + text

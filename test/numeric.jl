@@ -48,14 +48,14 @@
             "fwd matmul 2D"      => function ()
                 Wm = Float32[1 2 3 4; 5 6 7 8; 9 10 11 12]
                 X = Arg(2,3; name="X"); W = Var(vinit(Wm), 3,4)
-                (JOLT.AbstractTensor[X], JOLT.AbstractTensor[X * W], (A2,), [A2 * Wm])
+                (JOLT.AbstractTensor[X], JOLT.AbstractTensor[matmul(X, W)], (A2,), [A2 * Wm])
             end,
             "fwd matmul batched" => function ()
                 A3 = permutedims(cat(Float32[1 0 1; 0 1 0], 2Float32[1 0 1; 0 1 0]; dims=3), (3,1,2))       # (2,2,3)
                 Wb = permutedims(cat(Float32[1 0 0 1; 0 1 0 1; 0 0 1 1], Float32[1 0 0 1; 0 1 0 1; 0 0 1 1]; dims=3), (3,1,2))  # (2,3,4)
                 A = Var(vinit(A3), 2,2,3); B = Var(vinit(Wb), 2,3,4)
                 ref = similar(A3, 2,2,4); for i in 1:2; ref[i,:,:] = A3[i,:,:] * Wb[i,:,:]; end
-                (E, JOLT.AbstractTensor[A * B], (), [ref])
+                (E, JOLT.AbstractTensor[matmul(A, B)], (), [ref])
             end,
             # ---- first-order gradients ----
             "grad add"           => () -> (E, (a=V3([1,2,3]); b=V3([4,5,6]); L=sum(a+b);      JOLT.AbstractTensor[L, ∇(L;wrt=a), ∇(L;wrt=b)]), (), [21f0, ones(Float32,3), ones(Float32,3)]),
@@ -64,7 +64,7 @@
             "grad transpose"     => () -> (E, (a=Var(vinit(A2), 2,3); t=permutedims(a,(2,1)); L=sum(mul(t,t)); JOLT.AbstractTensor[∇(L;wrt=a)]), (), [2 .* A2]),
             "grad reshape"       => () -> (E, (a=Var(vinit(A2), 2,3); r=reshape(a,3,2); L=sum(mul(r,r)); JOLT.AbstractTensor[∇(L;wrt=a)]), (), [2 .* A2]),
             "grad matmul"        => function ()
-                X = Arg(2,3; name="X"); W = Var(Ones(), 3,4); L = sum(X*W)
+                X = Arg(2,3; name="X"); W = Var(Ones(), 3,4); L = sum(matmul(X, W))
                 (JOLT.AbstractTensor[X], JOLT.AbstractTensor[∇(L;wrt=W)], (A2,), [permutedims(A2)*ones(Float32,2,4)])
             end,
             "grad stop_gradient" => () -> (E, (a=V3([1,2,3]); b=V3([4,5,6]); L=sum(mul(stop_gradient(a),b)); JOLT.AbstractTensor[∇(L;wrt=a), ∇(L;wrt=b)]), (), [zeros(Float32,3), Float32[1,2,3]]),
@@ -76,7 +76,7 @@
             "grad matmul batched" => function ()
                 A3 = permutedims(cat(Float32[1 0 1; 0 1 0], 2Float32[1 0 1; 0 1 0]; dims=3), (3,1,2))
                 Wb = permutedims(cat(Float32[1 0 0 1; 0 1 0 1; 0 0 1 1], Float32[1 0 0 1; 0 1 0 1; 0 0 1 1]; dims=3), (3,1,2))
-                A = Var(vinit(A3), 2,2,3); B = Var(vinit(Wb), 2,3,4); L = sum(A * B)
+                A = Var(vinit(A3), 2,2,3); B = Var(vinit(Wb), 2,3,4); L = sum(matmul(A, B))
                 gA = similar(A3); gB = similar(Wb)
                 for i in 1:2
                     gA[i,:,:] = ones(Float32,2,4) * permutedims(Wb[i,:,:])   # ∂L/∂A[i] = 1·Bᵀ
@@ -88,6 +88,34 @@
             "2nd scalar d²(a²)=2"  => () -> (E, (a=Var(Float32, Fill(3f0)); L=mul(a,a); gL=∇(L;wrt=a); JOLT.AbstractTensor[L, gL, ∇(gL;wrt=a)]), (), [9f0, 6f0, 2f0]),
             "2nd vector d²Σa²"     => () -> (E, (a=V3([1,2,3]); L=sum(mul(a,a)); gL=∇(L;wrt=a); JOLT.AbstractTensor[L, gL, ∇(gL;wrt=a, seed=Const(ones(Float32,3)))]), (), [14f0, Float32[2,4,6], Float32[2,2,2]]),
             "2nd mixed d²Σab"      => () -> (E, (a=V3([1,2,3]); b=V3([4,5,6]); L=sum(mul(a,b)); gLa=∇(L;wrt=a); JOLT.AbstractTensor[gLa, ∇(gLa;wrt=b, seed=Const(ones(Float32,3)))]), (), [Float32[4,5,6], ones(Float32,3)]),
+            # ---- elementwise divide, ⊙, and einsum / dot (forward) ----
+            "fwd div"            => () -> (E, JOLT.AbstractTensor[Var(vinit(A2), 2,3) / Var(vinit(B2), 2,3)], (), [A2 ./ B2]),
+            "fwd ./ leftpad vec" => () -> (E, JOLT.AbstractTensor[Var(vinit(A2), 2,3) ./ Var(vinit(Float32[1,2,3]), 3)], (), [A2 ./ reshape(Float32[1,2,3],1,3)]),
+            "fwd ⊙ (== .*)"      => () -> (E, JOLT.AbstractTensor[Var(vinit(A2), 2,3) ⊙ Var(vinit(B2), 2,3)], (), [A2 .* B2]),
+            "fwd einsum matmul"  => function ()
+                Wm = Float32[1 2 3 4; 5 6 7 8; 9 10 11 12]
+                X = Arg(2,3; name="X"); W = Var(vinit(Wm), 3,4)
+                (JOLT.AbstractTensor[X], JOLT.AbstractTensor[einsum("ik,kj->ij", X, W)], (A2,), [A2 * Wm])
+            end,
+            "fwd einsum batched" => function ()
+                A3 = permutedims(cat(Float32[1 0 1; 0 1 0], 2Float32[1 0 1; 0 1 0]; dims=3), (3,1,2))
+                Wb = permutedims(cat(Float32[1 0 0 1; 0 1 0 1; 0 0 1 1], Float32[1 0 0 1; 0 1 0 1; 0 0 1 1]; dims=3), (3,1,2))
+                A = Var(vinit(A3), 2,2,3); B = Var(vinit(Wb), 2,3,4)
+                ref = similar(A3, 2,2,4); for i in 1:2; ref[i,:,:] = A3[i,:,:] * Wb[i,:,:]; end
+                (E, JOLT.AbstractTensor[einsum("bik,bkj->bij", A, B)], (), [ref])
+            end,
+            "fwd einsum dot"     => () -> (E, JOLT.AbstractTensor[einsum("i,i->", Var(vinit(Float32[1,2,3]),3), Var(vinit(Float32[4,5,6]),3))], (), [32f0]),
+            "fwd einsum outer"   => () -> (E, JOLT.AbstractTensor[einsum("i,j->ij", Var(vinit(Float32[1,2,3]),3), Var(vinit(Float32[4,5]),2))], (), [Float32[1,2,3] .* Float32[4 5]]),
+            "fwd dot"            => () -> (E, JOLT.AbstractTensor[dot(Var(vinit(Float32[1,2,3]),3), Var(vinit(Float32[4,5,6]),3))], (), [32f0]),
+            # ---- gradients of the new ops ----
+            "grad div"           => () -> (E, (a=V3([1,2,3]); b=V3([4,5,6]); L=sum(a / b); JOLT.AbstractTensor[∇(L;wrt=a), ∇(L;wrt=b)]), (), [Float32[1/4,1/5,1/6], -Float32[1/16,2/25,3/36]]),
+            "grad einsum matmul" => function ()
+                X = Arg(2,3; name="X"); W = Var(Ones(), 3,4); L = sum(einsum("ik,kj->ij", X, W))
+                (JOLT.AbstractTensor[X], JOLT.AbstractTensor[∇(L;wrt=W)], (A2,), [permutedims(A2)*ones(Float32,2,4)])
+            end,
+            "grad dot"           => () -> (E, (a=V3([1,2,3]); b=V3([4,5,6]); L=dot(a,b); JOLT.AbstractTensor[∇(L;wrt=a), ∇(L;wrt=b)]), (), [Float32[4,5,6], Float32[1,2,3]]),
+            # ---- second order THROUGH einsum: L=Σaᵢ²=dot(a,a) ⇒ g=2a, g²=2 ----
+            "2nd via einsum dot" => () -> (E, (a=V3([1,2,3]); L=dot(a,a); gL=∇(L;wrt=a); JOLT.AbstractTensor[L, gL, ∇(gL;wrt=a, seed=Const(ones(Float32,3)))]), (), [14f0, Float32[2,4,6], Float32[2,2,2]]),
         ]
 
         backends = Tuple{String,JOLT.IREEBackend}[("CPU", JOLT.IREE_CPU)]
@@ -114,11 +142,11 @@
         symcases = [
             # forward
             "sum over :B"    => () -> (x = Arg(:B,4;name="x"); (JOLT.AbstractTensor[x], JOLT.AbstractTensor[sum(x)], (Float32[1 2 3 4; 5 6 7 8; 9 10 11 12],), [Float32(sum(1:12))])),
-            "matmul :B×3"    => () -> (X = Arg(:B,3;name="X"); W = Var(Ones(), 3,4); (JOLT.AbstractTensor[X], JOLT.AbstractTensor[X*W], (A2,), [A2 * ones(Float32,3,4)])),
+            "matmul :B×3"    => () -> (X = Arg(:B,3;name="X"); W = Var(Ones(), 3,4); (JOLT.AbstractTensor[X], JOLT.AbstractTensor[matmul(X, W)], (A2,), [A2 * ones(Float32,3,4)])),
             "reduce over :B" => () -> (x = Arg(:B,4;name="x"); (JOLT.AbstractTensor[x], JOLT.AbstractTensor[reduce_sum(x,(1,))], (Float32[1 2 3 4; 5 6 7 8],), [vec(sum(Float32[1 2 3 4; 5 6 7 8]; dims=1))])),
             "two dyn args +" => () -> (x = Arg(:B,4;name="x"); y = Arg(:B,4;name="y"); (JOLT.AbstractTensor[x,y], JOLT.AbstractTensor[x+y], (Float32[1 2 3 4; 5 6 7 8], Float32[1 1 1 1; 2 2 2 2]), [Float32[2 3 4 5; 7 8 9 10]])),
             # gradients: cotangent broadcasts back over the dynamic axis
-            "grad matmul :B (gW)" => () -> (X = Arg(:B,3;name="X"); W = Var(Ones(), 3,4); L = sum(X*W); (JOLT.AbstractTensor[X], JOLT.AbstractTensor[∇(L;wrt=W)], (A2,), [permutedims(A2) * ones(Float32,2,4)])),
+            "grad matmul :B (gW)" => () -> (X = Arg(:B,3;name="X"); W = Var(Ones(), 3,4); L = sum(matmul(X, W)); (JOLT.AbstractTensor[X], JOLT.AbstractTensor[∇(L;wrt=W)], (A2,), [permutedims(A2) * ones(Float32,2,4)])),
             "grad bias over :B (gb)" => () -> (x = Arg(:B,4;name="x"); b = Var(Ones(), 4); L = sum(x .+ b); (JOLT.AbstractTensor[x], JOLT.AbstractTensor[∇(L;wrt=b)], (Float32[1 2 3 4; 5 6 7 8; 9 10 11 12],), [fill(3f0,4)])),
             # grads-on-grads THROUGH a dynamic graph: L=Σ(Xᵢⱼwⱼ)² ⇒ g1ⱼ=2wⱼΣᵢXᵢⱼ², g2ⱼ=2ΣᵢXᵢⱼ²
             "2nd-order through :B" => function ()

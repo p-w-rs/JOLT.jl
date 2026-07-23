@@ -1,29 +1,32 @@
 # =====================================================================
-# Matrix multiply — `*`, mirroring `@` in NumPy/JAX/TensorFlow.
+# Matrix multiply — `matmul` / `⊡`, mirroring `@` in NumPy/JAX/TensorFlow.
+# (`*` is elementwise here, basic.jl; contraction gets its own name.) A dedicated
+# dot_general is the cleanest input for IREE codegen, so matmul does NOT route
+# through einsum — einsum reuses THIS op after aligning its operands (einsum.jl).
 #
 # Batched: operands of EQUAL rank ≥ 2 with matching leading "batch" dims,
 # contracting the last dim of A with the second-last of B:
 #     (b…, m, k) · (b…, k, n)  ->  (b…, m, n)
 # (plain 2-D is just the b…-empty case). The contracted dim and every batch dim
 # must be provably equal — symbolic dims welcome, they lower to `?`. Backward
-# swaps the last two dims (the batched transpose) and reuses batched `*`, so
+# swaps the last two dims (the batched transpose) and reuses batched `matmul`, so
 # it's taped → higher order works:  Ā = ȳ · Bᵀ,  B̄ = Aᵀ · ȳ.
 #
 # Not yet: rank-mismatched forms like (b,l,d)·(d,k) and batch-dim broadcasting
-# — both need the reduce/broadcast layer; reshape to 2-D for now.
+# — reshape to equal rank, or use einsum, for now.
 # =====================================================================
 struct MatMulOp <: Op end
 
 function outshape(::MatMulOp, sa, sb)
     (length(sa) >= 2 && length(sa) == length(sb)) ||
-        error("*: batched matmul needs two tensors of equal rank ≥ 2; got $sa · $sb " *
-              "(reshape to 2-D for rank-mismatched contractions).")
+        error("matmul: batched matmul needs two tensors of equal rank ≥ 2; got $sa · $sb " *
+              "(reshape to 2-D, or use einsum, for rank-mismatched contractions).")
     for i in 1:length(sa)-2
         dims_equal(sa[i], sb[i]) ||
-            error("*: batch dim $i mismatch — $sa · $sb ($(sa[i]) vs $(sb[i]))")
+            error("matmul: batch dim $i mismatch — $sa · $sb ($(sa[i]) vs $(sb[i]))")
     end
     dims_equal(sa[end], sb[end-1]) ||
-        error("*: inner dims must match — $sa · $sb ($(sa[end]) vs $(sb[end-1])). " *
+        error("matmul: inner dims must match — $sa · $sb ($(sa[end]) vs $(sb[end-1])). " *
               "Declare same_dim! if they are equal.")
     return (sa[1:end-2]..., sa[end-1], sb[end])
 end
@@ -51,6 +54,9 @@ end
 # swap the last two dims, batch dims fixed — the batched transpose (Bᵀ).
 _swaplast(t::AbstractTensor) = (R = ndims(t); permutedims(t, (1:R-2..., R, R-1)))
 
-vjp(::MatMulOp, ȳ, ins, out) = (ȳ * _swaplast(ins[2]), _swaplast(ins[1]) * ȳ)
+# Ā = ȳ·Bᵀ, B̄ = Aᵀ·ȳ — reuses `matmul` (NOT `*`, which is now elementwise), so
+# the backward stays batched matmul and is itself taped → higher order works.
+vjp(::MatMulOp, ȳ, ins, out) = (matmul(ȳ, _swaplast(ins[2])), matmul(_swaplast(ins[1]), ȳ))
 
-Base.:*(a::AbstractTensor, b::AbstractTensor) = apply(MatMulOp(), a, b)
+matmul(a::AbstractTensor, b::AbstractTensor) = apply(MatMulOp(), a, b)
+const ⊡ = matmul     # U+29C1 (\boxdot): the TensorCore.jl glyph for generalised matmul

@@ -53,22 +53,27 @@
         @test size(cts[1]) == (2, 3, 4)                    # back to x's shape
     end
 
-    @testset "broadcasting (.+ .- .*)" begin
+    @testset "broadcasting (.+ .- .* ./ ⊙)" begin
         new_session!()
         z = Arg(3, 1) .+ Arg(1, 4)
         @test z isa AbstractTensor && size(z) == (3, 4)    # intercepted (not a Broadcasted), stretched
-        @test size(Arg(2, 3) .- Arg(3)) == (2, 3)    # left-pad align
-        @test size(Arg(2, 3) .* Arg(2, 3)) == (2, 3) # same shape
-        @test size(2f0 .* Arg(2, 3)) == (2, 3)          # scalar · tensor
+        @test size(Arg(2, 3) .- Arg(3)) == (2, 3)          # left-pad align
+        @test size(Arg(2, 3) .* Arg(2, 3)) == (2, 3)       # same shape
+        @test size(Arg(2, 3) ./ Arg(2, 3)) == (2, 3)       # ./ broadcasts (DivOp under the hood)
+        @test size(Arg(32, 10) .+ Arg(10)) == (32, 10)     # (32,10).+(10,): bias added to each row (TF/JAX)
+        @test size(Arg(32, 10) ./ Arg(10)) == (32, 10)
+        @test size(Arg(3, 1) ⊙ Arg(1, 4)) == (3, 4)        # ⊙ ≡ .* (Hadamard, broadcasting)
+        @test size(2f0 .* Arg(2, 3)) == (2, 3)             # scalar · tensor (dotted)
+        @test size(2f0 * Arg(2, 3)) == (2, 3)              # ...and bare scalar * / /
+        @test size(Arg(2, 3) / 2f0) == (2, 3)
         @test size(Arg(2, 3) .+ 1f0) == (2, 3)
         @test size(Arg(:B, 1) .+ Arg(:B, 4)) == (todim(:B), 4)  # dynamic dim CARRIED through
         @test_throws ErrorException Arg(3, 2) .+ Arg(4)         # 2 vs 4 not broadcastable
         # dynamic NEW axis (a bias over a :B batch) now builds — it lowers via
         # dynamic_broadcast_in_dim (runtime size read from the sibling with :B).
         @test size(Arg(:B, 4) .+ Arg(4)) == (todim(:B), 4)
-        # unsupported op / operand type throws (rather than silently doing the wrong
-        # thing); curated messages for these are deferred (need a tensor BroadcastStyle)
-        @test_throws Exception Arg(2, 3) ./ Arg(2, 3)
+        # still-unsupported dotted op (.^) / Array operand throws (curated messages deferred)
+        @test_throws Exception Arg(2, 3) .^ Arg(2, 3)
         @test_throws Exception Arg(2, 3) .+ [1f0, 2f0, 3f0]
     end
 

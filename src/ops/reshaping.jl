@@ -48,14 +48,16 @@ Base.reshape(a::AbstractTensor, dims::Union{Integer,Symbol,Poly}...) =
     apply(ReshapeOp(map(todim, dims)), a)
 
 # =====================================================================
-# Broadcasting — .+ / .- / .*  (NumPy/TF/JAX semantics).
+# Broadcasting — .+ / .- / .* / ./  (NumPy/TF/JAX semantics).
 #
 # `broadcast_to` (stablehlo.broadcast_in_dim) stretches an operand to a target
 # shape: input dim i maps to target dim `bdims[i]`; target dims NOT in `bdims`
-# are new axes the operand is replicated across. `.+`/`.-`/`.*` broadcast BOTH
-# operands to the common shape (dims.jl's broadcast_shapes) then reuse the
+# are new axes the operand is replicated across. `.+`/`.-`/`.*`/`./` broadcast
+# BOTH operands to the common shape (dims.jl's broadcast_shapes) then reuse the
 # strict same-shape op — so their gradients come for free from broadcast_to's
 # vjp (a reduce_sum over the stretched/new axes) composed with the base op.
+# LEFT-pad alignment (NumPy/TF/JAX), NOT Julia's leading-dim alignment:
+#     (32, 10) .+ (10,)  ->  (32, 10) .+ (1, 10)  ->  bias added to each row.
 # Non-fused: each dotted call emits its own op (the backend fuses).
 # =====================================================================
 struct BroadcastToOp <: Op
@@ -172,14 +174,33 @@ function _bcast(f, a::AbstractTensor, b::AbstractTensor)
              broadcast_to(b, s, _trailing_bdims(ndims(b), n); srcs = AbstractTensor[a, b]))
 end
 
-# More specific than Base's generic `broadcasted`, so these intercept .+/.-/.*
-# before Julia's array-broadcast path can engage.
+# More specific than Base's generic `broadcasted`, so these intercept .+/.-/.*/./
+# before Julia's array-broadcast path can engage. (`*` and `/` pass the STRICT
+# elementwise ops `mul`/`/` as the base — the broadcast_to wrappers make the
+# shapes equal first, so strictness is never violated.)
 Base.broadcasted(::typeof(+), a::AbstractTensor, b::AbstractTensor) = _bcast(+, a, b)
 Base.broadcasted(::typeof(-), a::AbstractTensor, b::AbstractTensor) = _bcast(-, a, b)
 Base.broadcasted(::typeof(*), a::AbstractTensor, b::AbstractTensor) = _bcast(mul, a, b)
+Base.broadcasted(::typeof(/), a::AbstractTensor, b::AbstractTensor) = _bcast(/, a, b)
 _scalar(a::AbstractTensor{T}, x::Real) where {T} = Constant(fill(convert(T, x)))
-Base.broadcasted(f::Union{typeof(+),typeof(-),typeof(*)}, a::AbstractTensor, x::Real) = Base.broadcasted(f, a, _scalar(a, x))
-Base.broadcasted(f::Union{typeof(+),typeof(-),typeof(*)}, x::Real, a::AbstractTensor) = Base.broadcasted(f, _scalar(a, x), a)
-# Unsupported dotted ops (./ .^) and Array operands still error — via Julia's
+Base.broadcasted(f::Union{typeof(+),typeof(-),typeof(*),typeof(/)}, a::AbstractTensor, x::Real) = Base.broadcasted(f, a, _scalar(a, x))
+Base.broadcasted(f::Union{typeof(+),typeof(-),typeof(*),typeof(/)}, x::Real, a::AbstractTensor) = Base.broadcasted(f, _scalar(a, x), a)
+# Unsupported dotted ops (.^) and Array operands still error — via Julia's
 # generic path — rather than silently doing the wrong thing. Curated messages
 # for those would need a dedicated tensor BroadcastStyle (deferred).
+
+# --- ⊙ : the circled-dot Hadamard product — a spelled alias of `.*`
+# (broadcasting elementwise multiply). ⊙ is the textbook elementwise-product
+# glyph (LSTM/GRU gating, TensorCore.jl's ⊙=hadamard); it is NOT a dot product
+# — that is `dot`/`⋅` (einsum.jl).
+⊙(a::AbstractTensor, b::AbstractTensor) = _bcast(mul, a, b)
+⊙(a::AbstractTensor, x::Real)           = _bcast(mul, a, _scalar(a, x))
+⊙(x::Real, a::AbstractTensor)           = _bcast(mul, _scalar(a, x), a)
+
+# --- scalar · tensor ergonomics. Bare `+ - * /` are strict same-shape for two
+# tensors, but a Real scalar has no shape to mismatch — it broadcasts (rank-0
+# stretches trivially), so `2f0 * x`, `x / 2f0`, etc. keep working.
+Base.:*(x::Real, a::AbstractTensor) = _bcast(mul, _scalar(a, x), a)
+Base.:*(a::AbstractTensor, x::Real) = _bcast(mul, a, _scalar(a, x))
+Base.:/(a::AbstractTensor, x::Real) = _bcast(/, a, _scalar(a, x))
+Base.:/(x::Real, a::AbstractTensor) = _bcast(/, _scalar(a, x), a)

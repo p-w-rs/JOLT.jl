@@ -41,7 +41,7 @@
             new_session!()
             X = Arg(2, 3; name="X")
             W = Var(Ones(), 3, 4)
-            Y = X * W; loss = sum(Y); gW = ∇(loss; wrt=W)
+            Y = matmul(X, W); loss = sum(Y); gW = ∇(loss; wrt=W)
             fn, vars = compile(0, [X], JOLT.AbstractTensor[Y, gW])
             Xv = Float32[1 2 3; 4 5 6]
             Yv, gWv = fn(vars, Xv)

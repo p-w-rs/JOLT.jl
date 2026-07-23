@@ -266,4 +266,28 @@ JOLT.lower(::BadRankOp, a::JOLT.AbstractTensor, b::JOLT.AbstractTensor) = JOLT.s
         @test length(cts) == 1 && size(cts[1]) == (2, 3)
     end
 
+    # -----------------------------------------------------------------
+    # `*` is elementwise (alias of `mul`); `/` is elementwise divide (DivOp).
+    # Both STRICT same-shape.  d(a/b) = (ȳ/b, -ȳ·a/b²).
+    # -----------------------------------------------------------------
+    @testset "elementwise * and / (strict)" begin
+        s = new_session!()
+        x = Arg(2, 3); y = Arg(2, 3)
+        z = x * y                                            # `*` is elementwise multiply now
+        @test z isa Result && size(z) == (2, 3)
+        @test s.tape[end][1].op isa JOLT.MulOp
+        @test_throws ErrorException Arg(2, 3) * Arg(3, 2)    # strict: no broadcast
+        @test_throws ErrorException Arg(2, 3) * Arg(2, 3, 1)
+
+        q = x / y
+        @test q isa Result && size(q) == (2, 3)
+        @test session().tape[end][1].op isa JOLT.DivOp
+        @test_throws ErrorException Arg(2, 3) / Arg(3, 2)    # strict same-shape
+
+        # div vjp: ∂a = ȳ/b, ∂b = -(ȳ·a)/(b·b) — built from divide+multiply+negate
+        ȳ = Arg(2, 3)
+        cts = JOLT.vjp(JOLT.DivOp(), ȳ, [x, y], q)
+        @test length(cts) == 2 && all(t -> t isa Result && size(t) == (2, 3), cts)
+    end
+
 end
