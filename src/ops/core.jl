@@ -22,6 +22,10 @@ function outshape end
 function lower end
 function vjp end
 
+# Most ops require every input to share an element type. A few legitimately mix
+# (e.g. `select`'s predicate is i1 while its branches are floats); those opt out.
+same_eltype(::Op) = true
+
 # One taped graph node: the primitive, its input tensors, the emitted StableHLO
 # op, and the symbolic output shape dims.jl computed (the source of truth — MLIR
 # only knows symbolic dims as anonymous `?`).
@@ -33,7 +37,7 @@ struct OpNode
 end
 
 function apply(op::Op, ins::AbstractTensor...)
-    allequal(eltype, ins) ||
+    (!same_eltype(op) || allequal(eltype, ins)) ||
         error("$(typeof(op)): mixed element types $(map(eltype, ins))")
     shape = outshape(op, map(size, ins)...)
     ir    = lower(op, ins...)

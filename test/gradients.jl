@@ -25,16 +25,14 @@
         @test g isa Vector{<:AbstractTensor} && length(g) == 2
         @test all(t -> size(t) == (), g)
 
-        # scope prefix (Symbol / Vector{Symbol}) -> path-keyed Dict
-        gd = ∇(loss; wrt=:variables)
-        @test gd isa Dict
-        @test sort(collect(keys(gd))) ==
-              [(:variables, :default, :_1), (:variables, :default, :_2)]
-        @test ∇(loss; wrt=[:variables]) |> keys |> collect |> sort ==
-              sort(collect(keys(gd)))
+        # scope path (Symbol / Vector{Symbol}) -> a PackedGrad shaped like the subtree
+        gs = ∇(loss; wrt=:variables)
+        @test gs isa JOLT.PackedGrad
+        @test size(gs.flat) == (2,)                    # two scalar variables, flattened + concatenated
+        @test ∇(loss; wrt=[:variables]) isa JOLT.PackedGrad
 
         # default wrt is :variables
-        @test keys(∇(loss)) == keys(gd)
+        @test ∇(loss) isa JOLT.PackedGrad
     end
 
     @testset "gradient alias" begin
@@ -63,9 +61,9 @@
         z = Var(Float32)     # never used in the loss
         loss = mul(a, a)
         @test ∇(loss; wrt=z) isa Constant                 # ∂loss/∂z = 0
-        # prefix collection stays complete: z still appears with a zero
-        gd = ∇(loss; wrt=:variables)
-        @test length(gd) == 2 && all(t -> t isa AbstractTensor, values(gd))
+        # prefix collection stays complete: z still appears (with a zero grad)
+        gs = ∇(loss; wrt=:variables)
+        @test gs isa JOLT.PackedGrad && size(gs.flat) == (2,)
     end
 
     @testset "stop_gradient cuts the flow" begin
@@ -165,6 +163,44 @@
         p = Var(3); q = Var(1)
         gp = ∇(sum(p .+ q); wrt=p)
         @test size(∇(sum(gp .* p); wrt=q)) == (1,)
+    end
+
+    @testset "gradient contract: PackedGrad, tuple selectors, state" begin
+        new_session!()
+        pushnamespace!("params")
+        W = Var(Ones(), 2, 3; name="W"); b = Var(Zeros(), 3; name="b")
+        popnamespace!()
+        x = Arg(2, 3; name="x")
+        loss = sum(mul(W, W)) + sum(mul(b, b)) + sum(mul(x, x))
+
+        # scope path -> PackedGrad; flat length = total params in the subtree
+        gs = ∇(loss; wrt=[:variables, :params])
+        @test gs isa JOLT.PackedGrad && size(gs.flat) == (2 * 3 + 3,)   # W (2×3) + b (3)
+
+        # tuple of selectors -> aligned tuple: scope + a single input + a list
+        gW, dx, dlist = ∇(loss; wrt=([:variables, :params], x, [W, x]))
+        @test gW isa JOLT.PackedGrad
+        @test dx isa Result && size(dx) == (2, 3)                      # ∂/∂x, an Argument
+        @test dlist isa Vector && length(dlist) == 2
+
+        # duplicate tensor in a list is allowed
+        dd = ∇(loss; wrt=[W, W])
+        @test length(dd) == 2 && all(t -> t isa AbstractTensor, dd)
+
+        # whole-bundle arithmetic keeps the PackedGrad (axes preserved); a reduction drops it
+        @test (gs * 2f0) isa JOLT.PackedGrad
+        @test (gs + gs) isa JOLT.PackedGrad
+        @test sum(gs ⊙ gs) isa Result
+
+        # scopes are literal: a non-match errors; :params alone is not a top-level scope
+        @test_throws ErrorException ∇(loss; wrt=:params)
+        @test_throws ErrorException ∇(loss; wrt=[:variables, :nope])
+
+        # an assign!'d ("state") variable is still an ordinary gradient target
+        new_session!()
+        v = Var(Ones(), 3)
+        assign!(v, v .+ 1f0)
+        @test ∇(sum(mul(v, v)); wrt=v) isa Result
     end
 
 end

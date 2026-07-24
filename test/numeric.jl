@@ -116,6 +116,18 @@
             "grad dot"           => () -> (E, (a=V3([1,2,3]); b=V3([4,5,6]); L=dot(a,b); JOLT.AbstractTensor[∇(L;wrt=a), ∇(L;wrt=b)]), (), [Float32[4,5,6], Float32[1,2,3]]),
             # ---- second order THROUGH einsum: L=Σaᵢ²=dot(a,a) ⇒ g=2a, g²=2 ----
             "2nd via einsum dot" => () -> (E, (a=V3([1,2,3]); L=dot(a,a); gL=∇(L;wrt=a); JOLT.AbstractTensor[L, gL, ∇(gL;wrt=a, seed=Const(ones(Float32,3)))]), (), [14f0, Float32[2,4,6], Float32[2,2,2]]),
+            # ---- new ops: activations, select, concatenate/slice/pad (fwd + grad) ----
+            "fwd tanh"           => () -> (E, JOLT.AbstractTensor[tanh(Var(vinit(Float32[-0.5,0,0.8]),3))], (), [tanh.(Float32[-0.5,0,0.8])]),
+            "fwd sqrt/rsqrt"     => () -> (E, JOLT.AbstractTensor[sqrt(Var(vinit(Float32[1,4,9]),3)), rsqrt(Var(vinit(Float32[1,4,0.25]),3))], (), [Float32[1,2,3], Float32[1,0.5,2]]),
+            "fwd sigmoid/relu"   => () -> (E, JOLT.AbstractTensor[sigmoid(Var(vinit(Float32[0,100,-100]),3)), relu(Var(vinit(Float32[-1,2,-3]),3))], (), [Float32[0.5,1,0], Float32[0,2,0]]),
+            "fwd select"         => () -> (X = Arg(;name="f"); (JOLT.AbstractTensor[X], JOLT.AbstractTensor[select(X .!= 0f0, Var(vinit(Float32[1,2,3]),3), Var(vinit(Float32[4,5,6]),3))], (fill(1f0),), [Float32[1,2,3]])),
+            "fwd concatenate"    => () -> (E, JOLT.AbstractTensor[concatenate(Var(vinit(Float32[1,2]),2), Var(vinit(Float32[3,4,5]),3))], (), [Float32[1,2,3,4,5]]),
+            "fwd slice/pad"      => () -> (E, JOLT.AbstractTensor[slice(Var(vinit(Float32[10,20,30,40,50]),5),2:4), pad(Var(vinit(Float32[7,8,9]),3);low=[1],high=[2])], (), [Float32[20,30,40], Float32[0,7,8,9,0,0]]),
+            "grad tanh"          => () -> (E, (a=V3([-0.5,0,0.8]); L=sum(tanh(a)); JOLT.AbstractTensor[∇(L;wrt=a)]), (), [1 .- tanh.(Float32[-0.5,0,0.8]).^2]),
+            "grad relu"          => () -> (E, (a=V3([-1,2,-3]); L=sum(relu(a)); JOLT.AbstractTensor[∇(L;wrt=a)]), (), [Float32[0,1,0]]),
+            "grad sqrt"          => () -> (E, (a=V3([0.25,4,1]); L=sum(sqrt(a)); JOLT.AbstractTensor[∇(L;wrt=a)]), (), [1f0 ./ (2 .* Float32[0.5,2,1])]),
+            "grad concatenate"   => () -> (E, (a=V3([1,2,3]); b=V3([4,5,6]); c=concatenate(a,b); L=sum(mul(c,c)); JOLT.AbstractTensor[∇(L;wrt=a), ∇(L;wrt=b)]), (), [Float32[2,4,6], Float32[8,10,12]]),
+            "grad slice"         => () -> (E, (a=Var(vinit(Float32[10,20,30,40,50]),5); s=slice(a,2:4); L=sum(mul(s,s)); JOLT.AbstractTensor[∇(L;wrt=a)]), (), [Float32[0,40,60,80,0]]),
         ]
 
         backends = Tuple{String,JOLT.IREEBackend}[("CPU", JOLT.IREE_CPU)]
@@ -227,6 +239,46 @@
             @test pointer(JOLT.getdata(vars)) == p0                    # arena preserved ⇒ still zero-copy
             L1, _ = fn(vars)                                           # IREE reads the updated weights
             @test L1 < L0                                              # the step decreased the loss
+        end
+
+        # ---- stateful variables (assign!), train/test mode, and a PackedGrad
+        # scope-selection driving a real Optimisers.update! on vars.params. ----
+        @testset "stateful + mode + PackedGrad Optimisers (CPU)" begin
+            # Hebbian: plastic W advances IN PLACE each call; deepcopy snapshots it
+            new_session!()
+            x = Arg(3; name="x")
+            pushnamespace!("h"); W = Var(vinit(Float32[1,1,1]), 3; name="W"); popnamespace!()
+            y = W .* x; assign!(W, W .+ x)
+            fn, vars = compile(0, [x], JOLT.AbstractTensor[sum(y)])
+            @test fn(vars, Float32[1,2,3]) ≈ 6f0  && collect(vars.h.W) == Float32[2,3,4]
+            snap = deepcopy(vars)
+            @test fn(vars, Float32[1,2,3]) ≈ 20f0 && collect(vars.h.W) == Float32[3,5,7]
+            @test collect(snap.h.W) == Float32[2,3,4]                  # snapshot untouched
+
+            # BatchNorm-style: running stat updates ONLY in train mode; frozen in test
+            new_session!()
+            train = Flag(true)
+            pushnamespace!("bn"); mu = Var(vinit(Float32[0,0,0]), 3; name="mu"); popnamespace!()
+            x = Arg(3; name="x")
+            assign!(mu, train, 0.9f0 .* mu .+ 0.1f0 .* x)
+            fn, vars = compile(0, [x], JOLT.AbstractTensor[x .- mu])
+            trainmode!(vars); fn(vars, Float32[10,20,30])
+            @test collect(vars.bn.mu) ≈ Float32[1,2,3]
+            testmode!(vars); before = deepcopy(collect(vars.bn.mu)); fn(vars, Float32[10,20,30])
+            @test collect(vars.bn.mu) == before
+
+            # PackedGrad from a scope selection → ComponentArray → Optimisers.update!(vars.params)
+            new_session!()
+            pushnamespace!("params"); w = Var(vinit(Float32[3,4,5]), 3; name="w"); popnamespace!()
+            L = sum(mul(w, w)); gs = ∇(L; wrt=[:variables, :params])
+            fn, vars = compile(0, JOLT.AbstractTensor[], Any[L, gs])
+            st = Optimisers.setup(Optimisers.Descent(0.1f0), vars.params)
+            L0, g0 = fn(vars)
+            @test g0 isa JOLT.ComponentArray && collect(g0.w) ≈ Float32[6,8,10]
+            st, p = Optimisers.update!(st, vars.params, g0)            # functional; packed grad matches vars.params
+            vars.params .= p                                           # write the step back into the shared arena (in place)
+            L1, _ = fn(vars)
+            @test L1 < L0
         end
     end
 end

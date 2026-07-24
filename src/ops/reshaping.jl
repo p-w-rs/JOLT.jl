@@ -204,3 +204,122 @@ Base.:*(x::Real, a::AbstractTensor) = _bcast(mul, _scalar(a, x), a)
 Base.:*(a::AbstractTensor, x::Real) = _bcast(mul, a, _scalar(a, x))
 Base.:/(a::AbstractTensor, x::Real) = _bcast(/, a, _scalar(a, x))
 Base.:/(x::Real, a::AbstractTensor) = _bcast(/, _scalar(a, x), a)
+
+# =====================================================================
+# Concatenate / slice / pad — fixed-layout shape ops whose backward passes are
+# ONE ANOTHER (concat→slice, slice→pad, pad→slice), so the trio is closed under
+# differentiation to any order. `concatenate` of vec'd tensors is what packs a
+# scope-selection's gradients into a single flat bundle (∇, gradients.jl).
+#
+# slice takes 1-based INCLUSIVE unit-stride ranges; pad takes per-axis low/high
+# zero-widths (no interior). Strided slice / interior pad are a later extension;
+# this subset {concat, unit-slice, edge-pad} stays closed on its own.
+# =====================================================================
+
+# --- concatenate along one axis -------------------------------------
+struct ConcatOp <: Op
+    dim::Int                                       # 1-based Julia axis
+end
+function outshape(op::ConcatOp, shapes...)
+    n = length(first(shapes))
+    all(s -> length(s) == n, shapes) ||
+        error("concatenate: all inputs must share rank; got $(map(length, shapes))")
+    (1 <= op.dim <= n) || error("concatenate: dim $(op.dim) out of range for rank $n")
+    for d in 1:n, s in shapes[2:end]
+        d == op.dim && continue
+        dims_equal(first(shapes)[d], s[d]) ||
+            error("concatenate: inputs differ off the concat axis at dim $d")
+    end
+    total = sum(s[op.dim] for s in shapes)
+    return ntuple(d -> d == op.dim ? total : first(shapes)[d], n)
+end
+lower(op::ConcatOp, ins...) = shlo.concatenate(IR.Value[t.value for t in ins];
+    result_0  = mlir_type(eltype(first(ins)), outshape(op, map(size, ins)...)),
+    dimension = ir_attr("$(ndims(first(ins)) - op.dim) : i64"))
+function vjp(op::ConcatOp, ȳ, ins, out)              # slice each input's slab back out
+    off = 0; cts = AbstractTensor[]
+    for t in ins
+        len  = size(t, op.dim)
+        rngs = ntuple(d -> d == op.dim ? (off+1:off+len) : (1:size(ȳ, d)), ndims(ȳ))
+        push!(cts, slice(ȳ, rngs...)); off += len
+    end
+    return Tuple(cts)
+end
+concatenate(ins::AbstractTensor...; dim::Integer = 1) = apply(ConcatOp(Int(dim)), ins...)
+
+# --- slice (1-based inclusive, unit stride) -------------------------
+struct SliceOp <: Op
+    starts::Vector{Int}
+    stops::Vector{Int}
+end
+function outshape(op::SliceOp, sa)
+    n = length(sa)
+    (length(op.starts) == n && length(op.stops) == n) ||
+        error("slice: need $n ranges for a rank-$n tensor")
+    for d in 1:n
+        (sa[d] isa Int) || error("slice: axis $d is symbolic; slice needs static extents")
+        (1 <= op.starts[d] <= op.stops[d] <= sa[d]) ||
+            error("slice: range $(op.starts[d]):$(op.stops[d]) out of bounds for axis $d (size $(sa[d]))")
+    end
+    return ntuple(d -> op.stops[d] - op.starts[d] + 1, n)
+end
+lower(op::SliceOp, a) = (rev = ndims(a):-1:1; shlo.slice(a.value;
+    result_0      = mlir_type(eltype(a), outshape(op, size(a))),
+    start_indices = i64array([op.starts[d] - 1 for d in rev]),
+    limit_indices = i64array([op.stops[d]      for d in rev]),
+    strides       = i64array([1 for _ in rev])))
+function vjp(op::SliceOp, ȳ, ins, out)               # scatter ȳ back into a zero tensor (edge pad)
+    insh = size(ins[1])
+    return (pad(ȳ; low = [op.starts[d] - 1 for d in 1:ndims(ȳ)],
+                   high = [insh[d] - op.stops[d] for d in 1:ndims(ȳ)]),)
+end
+slice(a::AbstractTensor, ranges::AbstractUnitRange...) =
+    apply(SliceOp(collect(Int, first.(ranges)), collect(Int, last.(ranges))), a)
+
+# --- pad (per-axis low/high zero edges; no interior) ----------------
+struct PadOp <: Op
+    low::Vector{Int}
+    high::Vector{Int}
+    value::Float64                                  # fill, cast to eltype at lower
+end
+function outshape(op::PadOp, sa)
+    n = length(sa)
+    (length(op.low) == n && length(op.high) == n) || error("pad: need $n (low,high) pairs")
+    return ntuple(d -> op.low[d] + sa[d] + op.high[d], n)   # Int + Dim: Poly arithmetic handles symbolic
+end
+function lower(op::PadOp, a)
+    T = eltype(a); rev = ndims(a):-1:1
+    pv = shlo.constant(; value = IR.DenseElementsAttribute(fill(convert(T, op.value))), output = mlir_type(T, ()))
+    push!(session().block, pv)
+    return shlo.pad(a.value, IR.result(pv, 1);
+        result_0         = mlir_type(T, outshape(op, size(a))),
+        edge_padding_low  = i64array([op.low[d]  for d in rev]),
+        edge_padding_high = i64array([op.high[d] for d in rev]),
+        interior_padding  = i64array([0 for _ in rev]))
+end
+vjp(op::PadOp, ȳ, ins, out) =                        # slice out the original (unpadded) region
+    (slice(ȳ, ntuple(d -> (op.low[d]+1 : op.low[d]+size(ins[1], d)), ndims(ȳ))...),)
+pad(a::AbstractTensor, value::Real = zero(eltype(a)); low, high) =
+    apply(PadOp(collect(Int, low), collect(Int, high), Float64(value)), a)
+
+# --- axis_size: a scalar tensor holding the RUNTIME size of one axis ----------
+# The keystone for reductions over a dynamic axis (mean over a :B batch): a
+# static axis folds to a Constant; a symbolic one reads its size at run time via
+# get_dimension_size and converts it to the tensor's element type. Non-
+# differentiable (it reads the shape, not the data), so its vjp is `nothing`.
+struct AxisSizeOp <: Op
+    dim::Int
+end
+outshape(::AxisSizeOp, sa) = ()
+function lower(op::AxisSizeOp, x)
+    gd = shlo.get_dimension_size(x.value; dimension = ir_attr("$(ndims(x) - op.dim) : i64"))
+    push!(session().block, gd)                        # rank-0 i32
+    return shlo.convert(IR.result(gd, 1); result = mlir_type(eltype(x), ()))
+end
+vjp(::AxisSizeOp, ȳ, ins, out) = (nothing,)
+function axis_size(x::AbstractTensor, d::Integer)
+    d = Int(d)
+    (1 <= d <= ndims(x)) || error("axis_size: axis $d out of range for a rank-$(ndims(x)) tensor")
+    s = size(x, d)
+    return s isa Int ? Constant(convert(eltype(x), s)) : apply(AxisSizeOp(d), x)
+end

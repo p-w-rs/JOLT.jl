@@ -19,6 +19,7 @@ mutable struct Session
     mod::Union{Nothing,IR.Module}
     facts::Facts                                # symbolic-dim constraints (dims.jl)
     tape::Vector{Tuple{OpNode,AbstractTensor}}  # (node, output), in emission order — the AD tape
+    assigns::Dict{AbstractTensor,AbstractTensor}  # variable => its next-value (assign!); last-call-wins
 end
 
 function Session()
@@ -35,6 +36,7 @@ function Session()
         nothing,
         Facts(),
         Tuple{OpNode,AbstractTensor}[],
+        Dict{AbstractTensor,AbstractTensor}(),
     )
 end
 

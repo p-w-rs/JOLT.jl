@@ -14,10 +14,12 @@ include("util.jl")
     include("session.jl")
     include("ops.jl")         # Op machinery + basic elementwise (add/sub/mul/neg)
     include("reduce.jl")      # reduce_sum, sum
-    include("reshaping.jl")   # reshape, transpose, broadcasting (.+ .- .* ./ ⊙)
+    include("reshaping.jl")   # reshape, transpose, broadcasting (.+ .- .* ./ ⊙), concat/slice/pad, axis_size
+    include("math.jl")        # sqrt, rsqrt, tanh, sigmoid, relu, select, compare
     include("matmul.jl")      # matmul / ⊡
     include("einsum.jl")      # einsum (general contraction), dot / ⋅
-    include("gradients.jl")   # ∇, second order, stop_gradient, grad_reversal, broadcasting grads
+    include("gradients.jl")   # ∇, second order, stop_gradient, grad_reversal, PackedGrad, tuple selectors
+    include("state.jl")       # assign!, Flag, trainmode!/testmode!
     include("compile.jl")     # end-to-end IREE compile+run (skips if IREE isn't built)
     include("numeric.jl")     # end-to-end NUMERICAL check: every op + 1st/2nd-order grads vs references
 end

@@ -52,10 +52,15 @@ export getArgument, getArg, getVariable, getVar, getConstant, getConst, getTenso
 include("ops/basic.jl")       # elementwise + - * / (mul), negate, divide
 include("ops/reduce.jl")      # reduce_sum, sum
 include("ops/reshaping.jl")   # reshape, transpose (permutedims), broadcast_to, .+/.-/.*/./ , ⊙
+include("ops/math.jl")        # sqrt, rsqrt, tanh, sigmoid, relu, select, compare, .>/.==/…
+include("ops/state.jl")       # assign!, Flag, trainmode!/testmode! (stateful variables)
 include("ops/matmul.jl")      # matmul / ⊡ — batched matmul
 include("ops/einsum.jl")      # einsum (general contraction), dot / ⋅
 include("ops/gradients.jl")   # ∇/gradient, stop_gradient, grad_reversal
 export mul, matmul, ⊡, ⊙, einsum, dot, ⋅
+export rsqrt, sigmoid, relu, select, compare
+export concatenate, slice, pad, axis_size
+export assign!, Flag, trainmode!, testmode!
 export ∇, gradient, stop_gradient, grad_reversal, reduce_sum, broadcast_to
 export ones_like, zeros_like, fill_like
 

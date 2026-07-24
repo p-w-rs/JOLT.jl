@@ -91,4 +91,28 @@
         @test size(r) == (2, 4)
     end
 
+    @testset "concatenate / slice / pad / axis_size" begin
+        new_session!()
+        a = Arg(2); b = Arg(3)
+        c = concatenate(a, b)
+        @test c isa Result && size(c) == (5,)
+        @test size(concatenate(Arg(2, 2), Arg(2, 2); dim=1)) == (4, 2)
+        @test size(concatenate(Arg(2, 2), Arg(2, 2); dim=2)) == (2, 4)
+        cts = JOLT.vjp(JOLT.ConcatOp(1), Arg(5), [a, b], c)        # concat vjp = slice each slab
+        @test size(cts[1]) == (2,) && size(cts[2]) == (3,)
+
+        x = Arg(5)
+        s = slice(x, 2:4)
+        @test size(s) == (3,)
+        @test size(JOLT.vjp(JOLT.SliceOp([2], [4]), Arg(3), [x], s)[1]) == (5,)   # vjp = pad
+        @test_throws ErrorException slice(Arg(5), 3:9)                            # out of bounds
+
+        p = pad(Arg(3); low=[2], high=[1])
+        @test size(p) == (6,)
+        @test size(JOLT.vjp(JOLT.PadOp([2], [1], 0.0), Arg(6), [Arg(3)], p)[1]) == (3,)   # vjp = slice
+
+        @test axis_size(Arg(4, 3), 1) isa Constant                # static folds to a Constant
+        @test axis_size(Arg(:B, 3), 1) isa Result && size(axis_size(Arg(:B, 3), 1)) == ()   # symbolic: runtime scalar
+    end
+
 end

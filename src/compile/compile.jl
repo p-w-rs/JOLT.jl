@@ -87,7 +87,9 @@ _tystr(::Type{T}, shape) where {T} =
 struct CompiledFn
     exe::IREEExecutable
     argplan::Vector{Int}    # compiled @main input i ← value of call arg #argplan[i]
-    nout::Int
+    nout::Int               # number of USER outputs (assign! state updates are appended after)
+    state_paths::Vector{Any}  # ComponentArray path of each assigned variable, in appended order
+    repack::Vector{Any}       # per user output: ComponentArray axes to rebuild a PackedGrad, else nothing
 end
 
 # The compiled @main takes ONLY the Arguments (Variables come via the provider).
@@ -176,21 +178,39 @@ function _dflat_text(s::Session, graph_mod::IR.Module, outputs::Vector{<:Abstrac
         "  }\n}\n")
 end
 
-function compile(rng, inputs::Vector{<:AbstractTensor}, outputs::Vector{<:AbstractTensor}; backend::IREEBackend = IREE_CPU)
+function compile(rng, inputs::Vector{<:AbstractTensor}, outputs::AbstractVector; backend::IREEBackend = IREE_CPU)
     all(t isa Argument for t in inputs) ||
         error("compile: `inputs` must be Argument tensors")
     s       = session()
     vars    = _materialize_vars(s, _seed_base(rng))
     argplan = _arg_plan(s, inputs)                        # before build_module finalizes the session
     layout  = _var_layout(s, vars)
+    # A PackedGrad output contributes its flat tensor to the graph; `fn` rebuilds
+    # it as a ComponentArray from the recorded axes. Plain tensors pass through.
+    raw    = AbstractTensor[]
+    repack = Any[]
+    for o in outputs
+        if o isa PackedGrad
+            push!(raw, o.flat); push!(repack, o.axes)
+        else
+            push!(raw, o);      push!(repack, nothing)
+        end
+    end
+    # assign! state updates become EXTRA graph outputs, appended after the user
+    # outputs; `fn` writes them back into `vars` in place (copy-back). Sorted by
+    # the variable's registry path so the appended order is deterministic.
+    path_of     = IdDict(t => p for (p, t) in s.names)
+    updates     = sort(collect(s.assigns); by = kv -> path_of[first(kv)])
+    state_paths = Any[path_of[v][2:end] for (v, _) in updates]
+    all_outputs = vcat(raw, AbstractTensor[nv for (_, nv) in updates])
     text = if isempty(layout)
-        stablehlo_text(build_module(s, outputs))          # no Variables → plain graph, no provider
+        stablehlo_text(build_module(s, all_outputs))      # no Variables → plain graph, no provider
     else
-        _dflat_text(s, build_module(s, outputs; entry = "__jolt_graph"), outputs, vars, layout)
+        _dflat_text(s, build_module(s, all_outputs; entry = "__jolt_graph"), all_outputs, vars, layout)
     end
     exe = iree_build(backend, text)
     isempty(layout) || bind_params!(exe, getdata(vars), _PARAM_SCOPE, _PARAM_KEY)
-    return CompiledFn(exe, argplan, length(outputs)), vars
+    return CompiledFn(exe, argplan, length(outputs), state_paths, repack), vars
 end
 
 function (f::CompiledFn)(vars, args...)
@@ -201,10 +221,20 @@ function (f::CompiledFn)(vars, args...)
               "do not reallocate it or pass a copy.")
     end
     outs = iree_run(e, Any[args[i] for i in f.argplan])
-    return f.nout == 1 ? outs[1] : Tuple(outs)
+    # write assign! state updates (appended after the user outputs) back into
+    # `vars` in place — the shared arena, so the next call reads the new value.
+    for (k, capath) in enumerate(f.state_paths)
+        sub = foldl(getproperty, capath; init = vars)
+        sub .= outs[f.nout + k]
+    end
+    # rebuild any PackedGrad output as a ComponentArray matching its vars subtree
+    user = Any[f.repack[i] === nothing ? outs[i] : ComponentArray(outs[i], f.repack[i]...) for i in 1:f.nout]
+    return f.nout == 1 ? user[1] : Tuple(user)
 end
 
 "The graph as StableHLO text — `compile` without a backend."
-export_stablehlo(inputs::Vector{<:AbstractTensor}, outputs::Vector{<:AbstractTensor}) =
-    (all(t isa Argument for t in inputs) || error("export: `inputs` must be Argument tensors");
-     stablehlo_text(build_module(session(), outputs)))
+function export_stablehlo(inputs::Vector{<:AbstractTensor}, outputs::AbstractVector)
+    all(t isa Argument for t in inputs) || error("export: `inputs` must be Argument tensors")
+    raw = AbstractTensor[o isa PackedGrad ? o.flat : o for o in outputs]
+    return stablehlo_text(build_module(session(), raw))
+end
