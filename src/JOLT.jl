@@ -67,6 +67,6 @@ export ones_like, zeros_like, fill_like
 include("compile/module.jl")  # graph → func.func → StableHLO module + text
 include("compile/iree.jl")    # IREE backend: iree-compile subprocess + runtime ccall shim
 include("compile/compile.jl") # compile / export / vars ComponentArray / the fn closure
-export compile, export_stablehlo, IREEBackend, IREE_CPU, IREE_METAL
+export compile, export_stablehlo, snapshot, pure, IREEBackend, IREE_CPU, IREE_METAL
 
 end # module JOLT

@@ -15,12 +15,8 @@ set(IREE_HAL_DRIVER_METAL  ON  CACHE BOOL "" FORCE)
 add_subdirectory(${IREE_SRC} iree_core)
 
 add_library(jolt_iree SHARED shim.c)
-# iree::runtime is the core meta-target; the io_parameters weight path lives in
-# separate libs it doesn't transitively pull in (only iree::io::file_handle is).
-target_link_libraries(jolt_iree PRIVATE
-  iree::runtime
-  iree::io::parameter_index
-  iree::io::parameter_index_provider
-  iree::io::parameter_provider
-  iree::io::scope_map
-  iree::modules::io::parameters)
+# iree::runtime is the core meta-target and all the shim needs: `vars` travel as
+# a zero-copy imported call argument (iree_hal_allocator_import_buffer), not
+# through the io_parameters weight-serving path, so none of the iree::io::* libs
+# are linked.
+target_link_libraries(jolt_iree PRIVATE iree::runtime)

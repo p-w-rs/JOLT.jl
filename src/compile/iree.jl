@@ -40,8 +40,9 @@ function _ensure_runtime()
     lib = IREEBuild.runtime_lib(_UUID)
     isfile(lib) || IREEBuild.build_runtime!(_UUID)
     _lib[] = Libdl.dlopen(lib)
-    for f in (:jolt_session_create, :jolt_session_release, :jolt_call_begin, :jolt_push_input,
-              :jolt_invoke, :jolt_output_next, :jolt_output_read, :jolt_call_end)
+    for f in (:jolt_session_create, :jolt_session_release, :jolt_import_probe,
+              :jolt_call_begin, :jolt_push_arena, :jolt_push_input, :jolt_invoke,
+              :jolt_output_next, :jolt_output_read, :jolt_call_end)
         _sym[f] = Libdl.dlsym(_lib[], f)
     end
     return
@@ -53,15 +54,15 @@ mutable struct IREEExecutable
     vmfb::String
     driver::String
     session::Ptr{Cvoid}
-    # Zero-copy weights (io_parameters): the session's provider ALIASES this arena
-    # (the `vars` ComponentArray's backing). `param_hold` keeps it GC-alive for the
-    # session's lifetime — the import is non-owning. `param_nbytes == 0` ⇒ no
-    # provider (a graph with no variables, or a non-IREE path).
-    param_ptr::Ptr{Cvoid}
-    param_nbytes::Int
-    param_hold::Any
-    scope::String
-    key::String
+    # The `vars` arena rides as READ-ONLY call input 0 (see compile.jl / shim.c):
+    # the graph slices each Variable out of it, and `assign!` updates come back as
+    # separate outputs that `fn` copies into the arena. `has_arena` ⇒ the graph
+    # takes it. `zerocopy` is the per-session import probe: -1 not yet probed, 1 the
+    # device reads the arena zero-copy (CPU heap / Metal shared) — a Julia-side
+    # mutation between calls is then seen live; 0 the arena is copied in per call
+    # (e.g. a discrete GPU that can't alias host memory).
+    has_arena::Bool
+    zerocopy::Int
 end
 
 "Compile StableHLO `text` to a .vmfb for `backend`."
@@ -70,25 +71,12 @@ function iree_build(backend::IREEBackend, text::AbstractString)
     dir = mktempdir(); inp = joinpath(dir, "in.mlir"); vmfb = joinpath(dir, "out.vmfb")
     write(inp, text)
     # Respect the user's declared dtype: iree-compile demotes f64→f32 and i64→i32
-    # by DEFAULT, which would silently lose precision (and breaks our parameter
-    # global, whose value attr keeps the original type). Keep the declared type;
-    # a backend that can't support it (e.g. f64 on Metal) then errors honestly.
+    # by DEFAULT, which would silently lose precision. Keep the declared type; a
+    # backend that can't support it (e.g. f64 on Metal) then errors honestly.
     run(`$(_iree_compile()) --iree-input-type=stablehlo
          --iree-input-demote-f64-to-f32=false --iree-input-demote-i64-to-i32=false
          --iree-hal-target-backends=$(backend.target) $(backend.cflags) $inp -o $vmfb`)
-    return IREEExecutable(vmfb, backend.driver, C_NULL, C_NULL, 0, nothing, "", "")
-end
-
-# Bind `vars`' contiguous arena as the session's zero-copy weights parameter.
-# Called by `compile` once the ComponentArray exists; the executable then keeps
-# the arena alive and hands its pointer to the provider at session-create.
-function bind_params!(e::IREEExecutable, data::AbstractVector, scope::AbstractString, key::AbstractString)
-    e.param_hold   = data
-    e.param_ptr    = pointer(data)
-    e.param_nbytes = sizeof(data)
-    e.scope        = String(scope)
-    e.key          = String(key)
-    return e
+    return IREEExecutable(vmfb, backend.driver, C_NULL, false, -1)
 end
 
 # Contiguous column-major bytes of `a`. With the reverse-dims graph these bytes
@@ -97,43 +85,70 @@ end
 _flat(a::Array)         = vec(a)
 _flat(a::AbstractArray) = vec(Array(a))
 
-"Run the program on `inputs` (host arrays, in func-signature order) → output host arrays."
-function iree_run(e::IREEExecutable, inputs::Vector)
+"""
+Run the program → output host arrays (user outputs, then each `assign!`ed
+variable's new value). `arena` is the `vars` ComponentArray's contiguous backing
+(or `nothing` for a graph with no Variables): it is pushed as READ-ONLY call
+input 0 — imported zero-copy where the device allows (so a Julia-side mutation
+between calls is seen live), else copied in. `inputs` are the activation values
+in @main Argument order (copied in). `fn` copies the trailing state outputs back
+into `arena`'s slots.
+"""
+function iree_run(e::IREEExecutable, arena, inputs::Vector)
     _ensure_runtime()
+    has_arena = e.has_arena && arena !== nothing && !isempty(arena)
     if e.session == C_NULL
-        e.session = GC.@preserve e ccall(_sym[:jolt_session_create], Ptr{Cvoid},
-            (Cstring, Cstring, Cstring, Cstring, Ptr{Cvoid}, Int64),
-            e.vmfb, e.driver, e.scope, e.key, e.param_ptr, Int64(e.param_nbytes))
+        e.session = ccall(_sym[:jolt_session_create], Ptr{Cvoid},
+            (Cstring, Cstring), e.vmfb, e.driver)
         e.session == C_NULL && error("IREE: session create failed for $(e.vmfb) on driver `$(e.driver)`")
+        # Probe once: can this device import the arena zero-copy (read live)?
+        if has_arena
+            e.zerocopy = GC.@preserve arena Int(ccall(_sym[:jolt_import_probe], Cint,
+                (Ptr{Cvoid}, Ptr{Cvoid}, Int64), e.session, pointer(arena), Int64(sizeof(arena))))
+        else
+            e.zerocopy = 0
+        end
     end
-    call = ccall(_sym[:jolt_call_begin], Ptr{Cvoid}, (Ptr{Cvoid}, Cstring), e.session, "module.main")
-    call == C_NULL && error("IREE: call_begin failed for entry `module.main`")
-    try
-        for x in inputs
-            arr = x isa AbstractArray ? x : fill(x)
-            data = _flat(arr); dims = Int64[reverse(size(arr))...]   # reversed dims (see mlir_type)
-            rc = GC.@preserve data dims ccall(_sym[:jolt_push_input], Cint,
-                (Ptr{Cvoid}, Cint, Cint, Ptr{Int64}, Ptr{Cvoid}, Int64),
-                call, Cint(_ecode(eltype(arr))), Cint(ndims(arr)),
-                pointer(dims), pointer(data), Int64(sizeof(data)))
-            rc == 0 || error("IREE: push_input failed (rc=$rc)")
+    GC.@preserve arena begin
+        call = ccall(_sym[:jolt_call_begin], Ptr{Cvoid}, (Ptr{Cvoid}, Cstring), e.session, "module.main")
+        call == C_NULL && error("IREE: call_begin failed for entry `module.main`")
+        try
+            # arena as read-only input 0: zero-copy import where supported, else copy-in.
+            if has_arena
+                adims = Int64[length(arena)]          # a flat 1-D tensor (reverse of [n] is [n])
+                m = GC.@preserve adims Int(ccall(_sym[:jolt_push_arena], Cint,
+                    (Ptr{Cvoid}, Cint, Cint, Ptr{Int64}, Ptr{Cvoid}, Int64, Cint),
+                    call, Cint(_ecode(eltype(arena))), Cint(1), pointer(adims),
+                    pointer(arena), Int64(sizeof(arena)), Cint(e.zerocopy == 1 ? 1 : 0)))
+                m < 0 && error("IREE: push_arena failed")
+            end
+            # activation inputs (copied in), in @main Argument order.
+            for x in inputs
+                arr = x isa AbstractArray ? x : fill(x)
+                data = _flat(arr); dims = Int64[reverse(size(arr))...]   # reversed dims (see mlir_type)
+                rc = GC.@preserve data dims ccall(_sym[:jolt_push_input], Cint,
+                    (Ptr{Cvoid}, Cint, Cint, Ptr{Int64}, Ptr{Cvoid}, Int64),
+                    call, Cint(_ecode(eltype(arr))), Cint(ndims(arr)),
+                    pointer(dims), pointer(data), Int64(sizeof(data)))
+                rc == 0 || error("IREE: push_input failed (rc=$rc)")
+            end
+            ccall(_sym[:jolt_invoke], Cint, (Ptr{Cvoid},), call) == 0 || error("IREE: invoke failed")
+            ec = Ref{Cint}(0); rk = Ref{Cint}(0); dims = zeros(Int64, 16)
+            outs = Any[]
+            while (GC.@preserve dims ccall(_sym[:jolt_output_next], Cint,
+                    (Ptr{Cvoid}, Ref{Cint}, Ref{Cint}, Ptr{Int64}), call, ec, rk, pointer(dims))) == 0
+                T = _CODE2T[Int(ec[]) + 1]; r = Int(rk[]); shp = ntuple(i -> Int(dims[i]), r)
+                buf = Vector{T}(undef, prod(shp; init = 1))
+                GC.@preserve buf ccall(_sym[:jolt_output_read], Cint,
+                    (Ptr{Cvoid}, Ptr{Cvoid}, Int64), call, pointer(buf), Int64(sizeof(buf))) == 0 ||
+                    error("IREE: output_read failed")
+                # IREE reports the reversed shape; reshape the row-major bytes to the Julia
+                # shape (its reverse) — a column-major reshape reinterprets them, no transpose.
+                push!(outs, r == 0 ? buf[1] : reshape(buf, reverse(shp)...))
+            end
+            return outs
+        finally
+            ccall(_sym[:jolt_call_end], Cvoid, (Ptr{Cvoid},), call)
         end
-        ccall(_sym[:jolt_invoke], Cint, (Ptr{Cvoid},), call) == 0 || error("IREE: invoke failed")
-        outs = Any[]
-        ec = Ref{Cint}(0); rk = Ref{Cint}(0); dims = zeros(Int64, 16)
-        while (GC.@preserve dims ccall(_sym[:jolt_output_next], Cint,
-                (Ptr{Cvoid}, Ref{Cint}, Ref{Cint}, Ptr{Int64}), call, ec, rk, pointer(dims))) == 0
-            T = _CODE2T[Int(ec[]) + 1]; r = Int(rk[]); shp = ntuple(i -> Int(dims[i]), r)
-            buf = Vector{T}(undef, prod(shp; init = 1))
-            GC.@preserve buf ccall(_sym[:jolt_output_read], Cint,
-                (Ptr{Cvoid}, Ptr{Cvoid}, Int64), call, pointer(buf), Int64(sizeof(buf))) == 0 ||
-                error("IREE: output_read failed")
-            # IREE reports the reversed shape; reshape the row-major bytes to the Julia
-            # shape (its reverse) — a column-major reshape reinterprets them, no transpose.
-            push!(outs, r == 0 ? buf[1] : reshape(buf, reverse(shp)...))
-        end
-        return outs
-    finally
-        ccall(_sym[:jolt_call_end], Cvoid, (Ptr{Cvoid},), call)
     end
 end

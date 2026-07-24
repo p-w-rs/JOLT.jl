@@ -202,8 +202,9 @@
         end
 
         # ---- `vars` mutation is Julia-native and stays zero-copy: in-place edits
-        # keep the SAME backing arena (so IREE sees them) and a reallocation is
-        # rejected. All operations preserve `pointer(getdata(vars))`. ----
+        # keep the SAME backing arena (so IREE reads them live). `fn` accepts any
+        # CONGRUENT `vars` (the arena is a per-call argument), so a reallocated but
+        # layout-matching CA works too. ----
         @testset "vars mutation stays zero-copy (CPU)" begin
             new_session!()
             x = Arg(2; name="x")
@@ -222,7 +223,7 @@
             JOLT.getdata(vars) .= 0f0                                  # whole-buffer .=
             @test pointer(JOLT.getdata(vars)) == p0
             @test fn(vars, Float32[10,20]) == Float32[0, 0]
-            @test_throws Exception fn(vars .+ 0f0, Float32[10,20])     # a reallocated vars is rejected
+            @test fn(vars .+ 0f0, Float32[10,20]) == Float32[0, 0]     # a congruent (reallocated) vars is accepted
         end
 
         # ---- a REAL Optimisers.jl step: update! mutates `vars` in place, keeps the

@@ -3,33 +3,36 @@
 //
 // A thin C adapter over IREE's runtime C API, linked with iree::runtime (no
 // LLVM) into libjolt_iree, which Julia dlopens and ccalls. It runs a .vmfb
-// in-process: create a session (cached), push typed inputs, invoke, pop each
-// output (querying its runtime shape, which may be dynamic).
+// in-process: create a session (cached), push the shared `vars` arena + typed
+// activation inputs, invoke, pop each output.
 //
-// This is the CORRECTNESS-phase shim: inputs are copied in and outputs copied
-// out (host<->device), and JOLT reconciles Julia column-major vs IREE row-major
-// by transposing at the boundary. The zero-copy phase replaces the input path
-// with iree_hal_allocator_import_buffer (wrap Julia's aligned arena directly).
+// vars (weights + any assigned variables) travel as ONE flat, READ-ONLY call
+// argument — the `vars` ComponentArray's page-aligned arena — imported ZERO-COPY
+// as a host allocation (jolt_push_arena): the compiled graph slices each variable
+// out of it, so a Julia-side mutation between calls (an optimiser step, a mode
+// flip) is seen by the next invoke with no copy. `assign!` updates come back as
+// ordinary outputs that Julia copies into the arena's slots — the graph never
+// writes the arena, so no aliasing is involved.
+//
+// Zero-copy import works on unified memory (CPU heap, Apple Metal shared). On a
+// backend that can't alias a host allocation (a discrete GPU), or for an arena
+// that isn't import-eligible, jolt_push_arena falls back to copy-in. The
+// per-session capability is decided once by jolt_import_probe.
+//
+// Activation inputs also copy in (jolt_push_input). JOLT reconciles Julia
+// column-major vs IREE row-major with the reverse-dims graph convention, so the
+// host boundary is transpose-free.
 // =====================================================================
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "iree/runtime/api.h"
-// Zero-copy weights (io_parameters): the program's :variables are served by a
-// runtime parameter provider that ALIASES Julia's host arena instead of being
-// pushed as call inputs. See jolt_session_create.
-#include "iree/io/file_handle.h"
-#include "iree/io/parameter_index.h"
-#include "iree/io/parameter_index_provider.h"
-#include "iree/modules/io/parameters/module.h"
 
 typedef struct {
   iree_runtime_instance_t* instance;
   iree_hal_device_t* device;
   iree_runtime_session_t* session;
-  iree_io_parameter_index_t* param_index;    // owns the key→host-range mapping
-  iree_io_parameter_provider_t* provider;     // serves it to io_parameters.load
 } jolt_session;
 
 typedef struct {
@@ -78,21 +81,37 @@ static int hal2ecode(iree_hal_element_type_t t) {
   }
 }
 
-// Create a session over `vmfb`, using the named HAL `driver` (e.g. "local-task"
-// for CPU, "metal" for the Mac GPU).
-//
-// If `param_nbytes > 0`, wire up zero-copy weights: build a parameter index with
-// ONE entry (`scope`::`key` → the caller's host range [param_data, param_nbytes))
-// backed by a non-owning host-allocation file handle, wrap it in a provider, and
-// append the io_parameters module BEFORE the program module so the program's
-// `io_parameters.load` resolves against it. On the local/CPU backend the load
-// imports the host pointer with no copy, so the program reads Julia's arena in
-// place. `param_data` MUST stay live (GC.@preserve) and 64-byte aligned for the
-// lifetime of the session. `param_nbytes == 0` ⇒ no parameters (e.g. a graph
-// with no variables), and the session is built exactly as before.
-jolt_session* jolt_session_create(const char* vmfb_path, const char* driver,
-                                  const char* scope, const char* key,
-                                  void* param_data, int64_t param_nbytes) {
+// Import the caller's arena host allocation as a non-owning, READ-ONLY HAL buffer.
+// On CPU heap / Metal shared this wraps the pointer with NO copy (dispatches read
+// it directly); on a backend that can't alias host memory as device-local the
+// import fails and the caller copies in. Requesting DEVICE_LOCAL is what makes a
+// discrete GPU reject the import (its host allocations aren't device-local), which
+// is the signal to fall back. The null release callback means IREE never frees it
+// — the memory belongs to Julia and MUST outlive the buffer.
+static iree_status_t jolt_import_arena(jolt_session* s, void* ptr, int64_t nbytes,
+                                       iree_hal_buffer_t** out_buffer) {
+  iree_hal_external_buffer_t ext;
+  memset(&ext, 0, sizeof(ext));
+  ext.type = IREE_HAL_EXTERNAL_BUFFER_TYPE_HOST_ALLOCATION;
+  ext.flags = IREE_HAL_EXTERNAL_BUFFER_FLAG_NONE;
+  ext.size = (iree_device_size_t)nbytes;
+  ext.handle.host_allocation.ptr = ptr;
+  iree_hal_buffer_params_t params;
+  memset(&params, 0, sizeof(params));
+  params.type  = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL | IREE_HAL_MEMORY_TYPE_HOST_VISIBLE;
+  params.access = IREE_HAL_MEMORY_ACCESS_READ;
+  params.usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE |
+                 IREE_HAL_BUFFER_USAGE_TRANSFER |
+                 IREE_HAL_BUFFER_USAGE_MAPPING;
+  return iree_hal_allocator_import_buffer(
+      iree_runtime_session_device_allocator(s->session), params, &ext,
+      iree_hal_buffer_release_callback_null(), out_buffer);
+}
+
+// Create a session over `vmfb`, using the named HAL `driver` ("local-task" for
+// CPU, "metal" for the Mac GPU). vars are NOT bound here — they arrive per call
+// as jolt_push_arena's input 0.
+jolt_session* jolt_session_create(const char* vmfb_path, const char* driver) {
   jolt_session* s = (jolt_session*)calloc(1, sizeof(jolt_session));
   if (!s) return NULL;
   iree_runtime_instance_options_t opts;
@@ -105,43 +124,6 @@ jolt_session* jolt_session_create(const char* vmfb_path, const char* driver,
   iree_runtime_session_options_initialize(&sopts);
   if (!iree_status_is_ok(iree_runtime_session_create_with_device(
         s->instance, &sopts, s->device, iree_runtime_instance_host_allocator(s->instance), &s->session))) goto err;
-
-  if (param_nbytes > 0) {
-    iree_allocator_t host = iree_runtime_instance_host_allocator(s->instance);
-    iree_vm_instance_t* vm = iree_runtime_instance_vm_instance(s->instance);
-    // Non-owning wrap of Julia's arena (READ: IREE only reads weights; Julia
-    // writes them in place between calls). The null release callback means we
-    // keep ownership — the memory must outlive the session.
-    iree_io_file_handle_t* handle = NULL;
-    if (!iree_status_is_ok(iree_io_file_handle_wrap_host_allocation(
-            IREE_IO_FILE_ACCESS_READ,
-            iree_make_byte_span(param_data, (iree_host_size_t)param_nbytes),
-            iree_io_file_handle_release_callback_null(), host, &handle))) { logst("wrap_host", iree_ok_status()); goto err; }
-    iree_status_t st = iree_io_parameter_index_create(host, &s->param_index);
-    if (iree_status_is_ok(st)) {
-      iree_io_parameter_index_entry_t entry;
-      memset(&entry, 0, sizeof(entry));
-      entry.key    = iree_make_cstring_view(key);
-      entry.length = (uint64_t)param_nbytes;
-      entry.type   = IREE_IO_PARAMETER_INDEX_ENTRY_STORAGE_TYPE_FILE;
-      entry.storage.file.handle = handle;
-      entry.storage.file.offset = 0;
-      st = iree_io_parameter_index_add(s->param_index, &entry);
-    }
-    iree_io_file_handle_release(handle);   // the index retained it
-    if (!iree_status_is_ok(st)) { logst("param_index", st); goto err; }
-    if (!iree_status_is_ok(iree_io_parameter_index_provider_create(
-            iree_make_cstring_view(scope), s->param_index,
-            IREE_IO_PARAMETER_INDEX_PROVIDER_DEFAULT_MAX_CONCURRENT_OPERATIONS,
-            host, &s->provider))) { logst("provider", iree_ok_status()); goto err; }
-    iree_vm_module_t* pmod = NULL;
-    if (!iree_status_is_ok(iree_io_parameters_module_create(vm, 1, &s->provider, host, &pmod))) {
-      logst("params_module", iree_ok_status()); goto err; }
-    iree_status_t sa = iree_runtime_session_append_module(s->session, pmod);
-    iree_vm_module_release(pmod);          // the context retained it
-    if (!iree_status_is_ok(sa)) { logst("append_params", sa); goto err; }
-  }
-
   { iree_status_t st = iree_runtime_session_append_bytecode_module_from_file(s->session, vmfb_path);
     if (!iree_status_is_ok(st)) { logst("load", st); goto err; } }
   return s;
@@ -152,12 +134,30 @@ err:
 
 void jolt_session_release(jolt_session* s) {
   if (!s) return;
-  if (s->session)     iree_runtime_session_release(s->session);   // drops the module's provider ref
-  if (s->provider)    iree_io_parameter_provider_release(s->provider);
-  if (s->param_index) iree_io_parameter_index_release(s->param_index);
-  if (s->device)      iree_hal_device_release(s->device);
-  if (s->instance)    iree_runtime_instance_release(s->instance);
+  if (s->session)  iree_runtime_session_release(s->session);
+  if (s->device)   iree_hal_device_release(s->device);
+  if (s->instance) iree_runtime_instance_release(s->instance);
   free(s);
+}
+
+// Can this device import the caller's arena zero-copy for reads? Attempt the
+// host-allocation import, map it, and require the mapped pointer to be IDENTICAL
+// to the caller's — the only reliable signal (IMPORTABLE is unconditional on the
+// CPU heap and a false-negative on Metal). Returns 1 if zero-copy, else 0 (⇒
+// copy-in per call).
+int jolt_import_probe(jolt_session* s, void* ptr, int64_t nbytes) {
+  if (!s || !ptr || nbytes <= 0) return 0;
+  iree_hal_buffer_t* buf = NULL;
+  iree_status_t st = jolt_import_arena(s, ptr, nbytes, &buf);
+  if (!iree_status_is_ok(st)) { iree_status_ignore(st); return 0; }
+  iree_hal_buffer_mapping_t m; memset(&m, 0, sizeof(m));
+  st = iree_hal_buffer_map_range(buf, IREE_HAL_MAPPING_MODE_PERSISTENT,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, (iree_device_size_t)nbytes, &m);
+  int ok = iree_status_is_ok(st) && (m.contents.data == (uint8_t*)ptr);
+  if (iree_status_is_ok(st)) iree_hal_buffer_unmap_range(&m);
+  else iree_status_ignore(st);
+  iree_hal_buffer_release(buf);
+  return ok ? 1 : 0;
 }
 
 jolt_call* jolt_call_begin(jolt_session* s, const char* func) {
@@ -169,6 +169,53 @@ jolt_call* jolt_call_begin(jolt_session* s, const char* func) {
   return c;
 }
 
+// Push the `vars` arena as READ-ONLY call input 0. If `try_zerocopy`, attempt the
+// non-owning host-allocation import (wrapping Julia's bytes directly); on success
+// push that view and return 1. If the import is disabled or fails (unsupported
+// backend, non-import-eligible pointer), copy the arena into a device buffer and
+// return 0. Returns <0 on hard error. When 1, the arena MUST stay live
+// (GC.@preserve) through jolt_call_end.
+int jolt_push_arena(jolt_call* c, int ecode, int rank, const int64_t* dims,
+                    void* ptr, int64_t nbytes, int try_zerocopy) {
+  iree_hal_dim_t shape[16];
+  for (int i = 0; i < rank; i++) shape[i] = (iree_hal_dim_t)dims[i];
+  iree_hal_element_type_t et = ecode2hal(ecode);
+  iree_hal_buffer_view_t* view = NULL;
+  int mode = -1;
+
+  if (try_zerocopy) {
+    iree_hal_buffer_t* buf = NULL;
+    iree_status_t st = jolt_import_arena(c->s, ptr, nbytes, &buf);
+    if (iree_status_is_ok(st)) {
+      st = iree_hal_buffer_view_create(buf, (iree_host_size_t)rank, shape, et,
+          IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
+          iree_runtime_session_host_allocator(c->s->session), &view);
+      iree_hal_buffer_release(buf);   // the view retains it
+      if (iree_status_is_ok(st)) { mode = 1; }
+      else { iree_status_ignore(st); view = NULL; }
+    } else { iree_status_ignore(st); }
+  }
+
+  if (mode < 0) {   // copy-in fallback (device buffer holds a copy of the arena)
+    iree_hal_buffer_params_t params; memset(&params, 0, sizeof(params));
+    params.type  = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL | IREE_HAL_MEMORY_TYPE_HOST_VISIBLE;
+    params.usage = IREE_HAL_BUFFER_USAGE_DEFAULT;
+    iree_status_t st = iree_hal_buffer_view_allocate_buffer_copy(
+        iree_runtime_session_device(c->s->session),
+        iree_runtime_session_device_allocator(c->s->session),
+        (iree_host_size_t)rank, shape, et, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
+        params, iree_make_const_byte_span(ptr, (iree_host_size_t)nbytes), &view);
+    if (!iree_status_is_ok(st)) { logst("arena_copy", st); return -1; }
+    mode = 0;
+  }
+
+  iree_status_t st = iree_runtime_call_inputs_push_back_buffer_view(&c->call, view);
+  iree_hal_buffer_view_release(view);
+  if (!iree_status_is_ok(st)) { logst("arena_push", st); return -1; }
+  return mode;
+}
+
+// Push a typed activation input (copied in; host<->device).
 int jolt_push_input(jolt_call* c, int ecode, int rank, const int64_t* dims,
                     const void* data, int64_t nbytes) {
   iree_hal_dim_t shape[16];

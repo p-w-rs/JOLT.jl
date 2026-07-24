@@ -68,13 +68,15 @@ function _rehost(ca::ComponentArray)
 end
 
 # ====================================================================
-# D-flat weights (io_parameters): Variables are NOT compiled-in as func inputs.
-# The whole `vars` arena is served as ONE runtime parameter (scope::key), and the
-# graph slices each Variable out of it — so `vars` stays a dense ComponentArray
-# and IREE reads it zero-copy (see the shim + [[jolt-verified-constraints]]).
+# The `vars` arena as an in/out call argument (zero-copy write-back).
+# Variables are NOT compiled in as individual inputs and NOT served by a
+# parameter provider; the whole dense `vars` arena rides as ONE flat call
+# argument `%__arena`, out of which the graph slices each Variable. When any
+# variable is `assign!`'d, `%__arena` carries `{iree.abi.output = 0}` and the
+# graph `dynamic_update_slice`s the new value(s) back into it — so IREE aliases
+# result 0 onto the arena and mutates Julia's bytes IN PLACE (see shim.c). With
+# no assign!, the arena is a read-only input (zero-copy read, as before).
 # ====================================================================
-const _PARAM_SCOPE = "jolt"
-const _PARAM_KEY   = "params"
 
 # MLIR spellings, matching module.jl's mlir_type (REVERSE-DIMS: Julia (m,n) → nxm).
 _eltstr(::Type{Float32}) = "f32"; _eltstr(::Type{Float64}) = "f64"; _eltstr(::Type{Float16}) = "f16"
@@ -86,14 +88,17 @@ _tystr(::Type{T}, shape) where {T} =
 
 struct CompiledFn
     exe::IREEExecutable
-    argplan::Vector{Int}    # compiled @main input i ← value of call arg #argplan[i]
-    nout::Int               # number of USER outputs (assign! state updates are appended after)
-    state_paths::Vector{Any}  # ComponentArray path of each assigned variable, in appended order
+    argplan::Vector{Int}      # @main Argument #k (after the arena) ← value of call arg #argplan[k]
+    nout::Int                 # number of USER outputs returned to the caller
+    state_paths::Vector{Any}  # ComponentArray path of each `assign!`ed variable, in output order
     repack::Vector{Any}       # per user output: ComponentArray axes to rebuild a PackedGrad, else nothing
+    arena_len::Int            # element length of the compiled `vars` arena — layout guard
+    arena_elt::DataType       # element type of that arena
+    arena_axes::Any           # ComponentArray axes of the compiled `vars` — layout guard
 end
 
-# The compiled @main takes ONLY the Arguments (Variables come via the provider).
-# For each Argument in graph/block order, the index into the user's `inputs`.
+# The compiled @main takes the `vars` arena as input 0, then the Arguments. For
+# each Argument in graph/block order, the index into the user's `inputs`.
 function _arg_plan(s::Session, inputs::Vector{<:AbstractTensor})
     argidx = IdDict(t => i for (i, t) in enumerate(inputs))
     plan = Int[]
@@ -120,15 +125,29 @@ function _var_layout(s::Session, vars::ComponentArray)
     return layout
 end
 
-# Assemble the D-flat module text: the graph (as private @__jolt_graph) plus a
-# util.global weights parameter and a @main wrapper that loads it, inserts an
-# optimization_barrier (WORKAROUND: iree-compile 3.12 segfaults folding a
-# flow.tensor.slice whose source is a #flow.parameter — see test/compile.jl and
-# the filed IREE issue), slices each Variable out of the flat arena, and calls the
-# graph. Variables reach the graph via the provider, so @main's inputs are only
-# the Arguments.
-function _dflat_text(s::Session, graph_mod::IR.Module, outputs::Vector{<:AbstractTensor},
-                     vars::ComponentArray, layout::Dict{Tuple,Tuple{Int,Int}})
+# Assemble the module text: the graph as `private @__jolt_graph` (returning the
+# user outputs THEN each assigned variable's new value), plus a `@main` wrapper
+# that takes the flat `vars` arena as READ-ONLY %__arena (call input 0), slices
+# each Variable out of it with `stablehlo.slice`, calls the graph, and returns
+# every graph result unchanged. The arena is never written inside the graph — the
+# `assign!` updates come back as the trailing results, and `fn` copies them into
+# the arena's slots after the call (see the CompiledFn call). Reads are zero-copy
+# on unified memory (a Julia-side mutation between calls is seen live); the write
+# is a small host-side copy of only the changed variables.
+#
+# (In-place device-side write-back — aliasing the arena via `iree.abi.output` and
+# `flow.tensor.update` — was prototyped but is UNSAFE on iree-compile 3.12: that
+# path lowers to the `hal.tensor.alias` hint, which side-steps alias analysis, so
+# a read of an OLD value racing the in-place write is miscompiled order-dependently
+# and the protective `flow.tensor.slice` clone gets elided. Revisit if IREE gains
+# liveness-safe donation.)
+#
+# `raw` are the user outputs (in order); `targets` are the assigned Variables (in
+# the order their new values trail the graph outputs). Reverse-dims is a no-op for
+# the 1-D arena; per-Variable slices reshape to each Variable's reverse-dims type.
+function _arena_text(s::Session, graph_mod::IR.Module, raw::Vector{<:AbstractTensor},
+                     targets::Vector{<:AbstractTensor}, vars::ComponentArray,
+                     layout::Dict{Tuple,Tuple{Int,Int}})
     T = eltype(vars); elt = _eltstr(T)
     tot = length(getdata(vars)); flatty = "tensor<$(tot)x$(elt)>"
     path_of = IdDict(t => p for (p, t) in s.names)
@@ -142,12 +161,17 @@ function _dflat_text(s::Session, graph_mod::IR.Module, outputs::Vector{<:Abstrac
     args   = [t for t in s.argvars if t isa Argument]
     argno  = IdDict(t => k - 1 for (k, t) in enumerate(args))
     argsig = join(("%a$(argno[t]): $(_tystr(eltype(t), size(t)))" for t in args), ", ")
-    outtys = [_tystr(eltype(o), size(o)) for o in outputs]
-    outsig = length(outtys) == 1 ? outtys[1] : "(" * join(outtys, ", ") * ")"
+    fullsig = isempty(args) ? "%__arena: $flatty" : "%__arena: $flatty, $argsig"
+
+    # @__jolt_graph returns the user outputs then each assigned variable's new value;
+    # @main returns exactly those, unchanged.
+    res_tys = vcat([_tystr(eltype(o), size(o)) for o in raw],
+                   [_tystr(eltype(v), size(v)) for v in targets])
+    nres    = length(res_tys)
+    outsig  = nres == 1 ? res_tys[1] : "(" * join(res_tys, ", ") * ")"
 
     body = IOBuffer()
-    println(body, "    %__flat0 = util.global.load @jolt_params : $flatty")
-    println(body, "    %__flat = stablehlo.optimization_barrier %__flat0 : $flatty")
+    # slice each Variable out of the flat arena (read-only), in @__jolt_graph input order.
     callparams = String[]; callptys = String[]; varno = 0
     for t in s.argvars
         push!(callptys, _tystr(eltype(t), size(t)))
@@ -155,25 +179,24 @@ function _dflat_text(s::Session, graph_mod::IR.Module, outputs::Vector{<:Abstrac
             push!(callparams, "%a$(argno[t])")
         else
             off, len = layout[path_of[t][2:end]]
-            v = "%__v$(varno)"; varno += 1
-            println(body, "    $(v)s = stablehlo.slice %__flat [$(off):$(off+len)] : ($flatty) -> tensor<$(len)x$(elt)>")
+            varno += 1; v = "%__v$(varno)"
+            println(body, "    $(v)s = stablehlo.slice %__arena [$(off):$(off+len)] : ($flatty) -> tensor<$(len)x$(elt)>")
             println(body, "    $(v) = stablehlo.reshape $(v)s : (tensor<$(len)x$(elt)>) -> $(_tystr(eltype(t), size(t)))")
             push!(callparams, v)
         end
     end
     calltys = "(" * join(callptys, ", ") * ") -> $outsig"
-    if length(outtys) == 1
+    if nres == 1
         println(body, "    %__r = func.call @__jolt_graph($(join(callparams, ", "))) : $calltys")
-        println(body, "    return %__r : $(outtys[1])")
+        println(body, "    return %__r : $(res_tys[1])")
     else
-        println(body, "    %__r:$(length(outtys)) = func.call @__jolt_graph($(join(callparams, ", "))) : $calltys")
-        println(body, "    return $(join(("%__r#$(k-1)" for k in 1:length(outtys)), ", ")) : $(join(outtys, ", "))")
+        println(body, "    %__r:$(nres) = func.call @__jolt_graph($(join(callparams, ", "))) : $calltys")
+        println(body, "    return $(join(("%__r#$(k-1)" for k in 1:nres), ", ")) : $(join(res_tys, ", "))")
     end
 
     return string("module {\n",
-        "  util.global private @jolt_params = #flow.parameter.named<\"$(_PARAM_SCOPE)\"::\"$(_PARAM_KEY)\"> : $flatty\n",
         "  ", graph_func, "\n",
-        "  func.func @main($argsig) -> $outsig {\n",
+        "  func.func @main($fullsig) -> $outsig {\n",
         String(take!(body)),
         "  }\n}\n")
 end
@@ -196,33 +219,49 @@ function compile(rng, inputs::Vector{<:AbstractTensor}, outputs::AbstractVector;
             push!(raw, o);      push!(repack, nothing)
         end
     end
-    # assign! state updates become EXTRA graph outputs, appended after the user
-    # outputs; `fn` writes them back into `vars` in place (copy-back). Sorted by
-    # the variable's registry path so the appended order is deterministic.
+    # `assign!`ed variables become EXTRA graph outputs (their new values), trailing
+    # the user outputs; `fn` copies each back into its arena slot after the call.
+    # Sorted by the target variable's registry path so the trailing order (and the
+    # `state_paths` it must match) is deterministic.
     path_of     = IdDict(t => p for (p, t) in s.names)
     updates     = sort(collect(s.assigns); by = kv -> path_of[first(kv)])
-    state_paths = Any[path_of[v][2:end] for (v, _) in updates]
-    all_outputs = vcat(raw, AbstractTensor[nv for (_, nv) in updates])
-    text = if isempty(layout)
-        stablehlo_text(build_module(s, all_outputs))      # no Variables → plain graph, no provider
+    targets     = AbstractTensor[v  for (v, _)  in updates]  # variable written back
+    newvals     = AbstractTensor[nv for (_, nv) in updates]  # its new value (graph output)
+    state_paths = Any[path_of[v][2:end] for v in targets]    # CA path (drop the :variables head)
+    has_vars    = !isempty(layout)
+    text = if has_vars
+        _arena_text(s, build_module(s, vcat(raw, newvals); entry = "__jolt_graph"),
+                    raw, targets, vars, layout)
     else
-        _dflat_text(s, build_module(s, all_outputs; entry = "__jolt_graph"), all_outputs, vars, layout)
+        stablehlo_text(build_module(s, raw))              # no Variables → no arena arg
     end
     exe = iree_build(backend, text)
-    isempty(layout) || bind_params!(exe, getdata(vars), _PARAM_SCOPE, _PARAM_KEY)
-    return CompiledFn(exe, argplan, length(outputs), state_paths, repack), vars
+    exe.has_arena = has_vars
+    d = getdata(vars)
+    return CompiledFn(exe, argplan, length(outputs), state_paths, repack,
+                      length(d), eltype(d), getaxes(vars)), vars
+end
+
+# `vars` may be any ComponentArray congruent with the compiled one (the same
+# arena, a `snapshot`, or a fresh congruent CA) — its layout must match what the
+# graph baked in. We check length + eltype + axes rather than object identity, so
+# snapshots and populations work.
+function _check_arena(f::CompiledFn, vars)
+    f.exe.has_arena || return
+    d = getdata(vars)
+    (length(d) == f.arena_len && eltype(d) == f.arena_elt && getaxes(vars) == f.arena_axes) ||
+        error("compile: `fn` needs a `vars` matching the compiled layout (length $(f.arena_len), " *
+              "eltype $(f.arena_elt)). Pass the `vars` from `compile`, a `snapshot`, or a congruent " *
+              "ComponentArray — not a reshaped, retyped, or differently-scoped one.")
 end
 
 function (f::CompiledFn)(vars, args...)
-    e = f.exe
-    if e.param_nbytes > 0 && pointer(getdata(vars)) != e.param_ptr
-        error("compile: `fn` must be called with the SAME `vars` ComponentArray it was compiled with " *
-              "(its arena is shared with IREE zero-copy). Mutate `vars` in place (e.g. Optimisers.update!); " *
-              "do not reallocate it or pass a copy.")
-    end
-    outs = iree_run(e, Any[args[i] for i in f.argplan])
-    # write assign! state updates (appended after the user outputs) back into
-    # `vars` in place — the shared arena, so the next call reads the new value.
+    _check_arena(f, vars)
+    arena = f.exe.has_arena ? getdata(vars) : nothing
+    outs = iree_run(f.exe, arena, Any[args[i] for i in f.argplan])
+    # `assign!` updates trail the user outputs; copy each into its `vars` slot in
+    # place (same arena ⇒ the next call reads the new value). Reads inside the graph
+    # used the OLD value (the arena is read-only there), so this is read-old/write-new.
     for (k, capath) in enumerate(f.state_paths)
         sub = foldl(getproperty, capath; init = vars)
         sub .= outs[f.nout + k]
@@ -230,6 +269,41 @@ function (f::CompiledFn)(vars, args...)
     # rebuild any PackedGrad output as a ComponentArray matching its vars subtree
     user = Any[f.repack[i] === nothing ? outs[i] : ComponentArray(outs[i], f.repack[i]...) for i in 1:f.nout]
     return f.nout == 1 ? user[1] : Tuple(user)
+end
+
+# ---- vars lifecycle: snapshot / pure ---------------------------------------
+
+"""
+    snapshot(vars) -> ComponentArray
+
+A deep copy of `vars` backed by a FRESH page-aligned arena (like the one
+`compile` returns), so it stays eligible for zero-copy IREE import. Use this —
+not `deepcopy` — to keep a checkpoint you can pass back to `fn`, or to seed a
+population: `deepcopy` loses the aligned arena backing and would fall back to a
+copy. `fn` advances any `assign!`ed variables IN the arena of whatever `vars` it
+is handed, so `snapshot` first to preserve the current values.
+"""
+function snapshot(vars::ComponentArray)
+    d = getdata(vars)
+    isempty(d) && return ComponentArray(copy(d), getaxes(vars)...)
+    arena = Mmap.mmap(Vector{eltype(d)}, length(d))       # anonymous ⇒ page-aligned
+    copyto!(arena, d)
+    return ComponentArray(arena, getaxes(vars)...)
+end
+
+"""
+    y, new_vars = pure(fn, vars, args...)
+
+Run `fn` functionally: snapshot `vars`, run `fn` on the snapshot, and return
+`(outputs, snapshot)`. The `vars` you pass in is left UNCHANGED; `new_vars` holds
+any advanced (`assign!`ed) values. This trades a whole-arena copy for
+immutability — in a hot loop call `fn(vars, args...)` directly (zero-copy,
+mutates in place).
+"""
+function pure(fn, vars::ComponentArray, args...)
+    snap = snapshot(vars)
+    y = fn(snap, args...)
+    return y, snap
 end
 
 "The graph as StableHLO text — `compile` without a backend."
